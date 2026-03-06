@@ -2,6 +2,13 @@
 
 An async Python SDK for the [Cantex](https://cantex.io) decentralised exchange API. It handles authentication, transaction signing, and provides typed response models for all API endpoints.
 
+## License
+
+MIT OR Apache-2.0  
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+at your option.
+
 ## Installation
 
 The SDK requires Python 3.11+:
