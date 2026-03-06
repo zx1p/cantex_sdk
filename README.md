@@ -11,6 +11,21 @@ Lihat [LICENSE-MIT](LICENSE-MIT) dan [LICENSE-APACHE](LICENSE-APACHE).
 
 ---
 
+## Platform yang Didukung
+
+Bot ini telah diuji dan berjalan di platform berikut:
+
+**Windows (PowerShell)**
+![Windows PowerShell](assets/screenshot-windows.png)
+
+**Linux / Ubuntu**
+![Linux Ubuntu](assets/screenshot-linux.png)
+
+**Android (Termux + proot-distro)**
+![Termux dengan proot-distro](assets/screenshot-termux.jpeg)
+
+---
+
 ## Instalasi
 
 Membutuhkan Python 3.11+ dan [uv](https://github.com/astral-sh/uv).

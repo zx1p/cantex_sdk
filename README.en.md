@@ -11,6 +11,21 @@ See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 ---
 
+## Supported Platforms
+
+The bot has been tested and runs on the following platforms:
+
+**Windows (PowerShell)**
+![Windows PowerShell](assets/screenshot-windows.png)
+
+**Linux / Ubuntu**
+![Linux Ubuntu](assets/screenshot-linux.png)
+
+**Android (Termux + proot-distro)**
+![Termux with proot-distro](assets/screenshot-termux.png)
+
+---
+
 ## Installation
 
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
