@@ -78,7 +78,7 @@ Then edit `config.json` to set your swap parameters (see below).
 ## Running the bot
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 Stop at any time with `Ctrl+C`.

@@ -78,7 +78,7 @@ Kemudian edit `config.json` untuk mengatur parameter swap (lihat di bawah).
 ## Menjalankan Bot
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 Hentikan kapan saja dengan `Ctrl+C`.
