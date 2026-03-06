@@ -4,17 +4,28 @@
 """
 Cantex SDK -- Swap Bot
 
-Reads all configuration from config.json and runs an automated swap loop:
+Reads swap configuration from config.json and credentials from environment
+variables (or a .env file). Runs an automated swap loop:
 
-  - Picks a random sell amount between amount_min and amount_max.
-  - Checks live balances: sells token_a (CC) if it has enough, otherwise
-    falls back to selling token_b (USDCx) and buying token_a instead.
+  - Resolves live InstrumentId objects for token_a and token_b at startup.
+  - Checks live balances each cycle: sells token_a if it has enough, otherwise
+    falls back to selling token_b (reverse swap).
+  - Picks a random sell amount between amount_min and the available balance.
   - Fetches a quote and skips the swap if the network fee >= max_network_fee.
   - Waits a random interval (interval_min_minutes – interval_max_minutes)
     between every cycle, whether the swap ran or was skipped.
 
-Edit config.json to configure keys, instruments, amounts, intervals and the
-fee threshold before running:
+Required environment variables (or entries in a .env file):
+
+    CANTEX_OPERATOR_KEY   Ed25519 private key hex
+    CANTEX_TRADING_KEY    secp256k1 private key hex
+
+Optional:
+
+    CANTEX_BASE_URL       API base URL (default: https://api.testnet.cantex.io)
+
+Edit config.json to configure instruments, amounts, intervals, and the fee
+threshold, then run:
 
     python main.py
 """
@@ -64,11 +75,9 @@ def load_config(path: str = CONFIG_PATH) -> dict:
     with open(path, "r") as fh:
         cfg = json.load(fh)
 
-    # Basic sanity checks so we fail early with a clear message.
-    for top_key in ("operator_key", "trading_key", "swap"):
-        if top_key not in cfg:
-            log.error("Missing required top-level key '%s' in %s", top_key, path)
-            sys.exit(1)
+    if "swap" not in cfg:
+        log.error("Missing required top-level key 'swap' in %s", path)
+        sys.exit(1)
 
     swap = cfg["swap"]
     for key in ("token_a", "token_b"):
@@ -90,48 +99,6 @@ def load_config(path: str = CONFIG_PATH) -> dict:
             sys.exit(1)
 
     return cfg
-
-
-# ---------------------------------------------------------------------------
-# Signer helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_signer(key_cfg: dict, cls, label: str):
-    """
-    Build a signer from a config block::
-
-        {"source": "env",  "env_var":   "CANTEX_OPERATOR_KEY"}
-        {"source": "file", "file_path": "secrets/operator.key", "file_type": "hex"}
-    """
-    source = key_cfg.get("source", "env")
-
-    if source == "env":
-        env_var = key_cfg.get("env_var", f"CANTEX_{label.upper()}_KEY")
-        value = os.environ.get(env_var)
-        if not value:
-            log.error("Environment variable '%s' is not set", env_var)
-            sys.exit(1)
-        return cls.from_hex(value)
-
-    if source == "file":
-        file_path = key_cfg.get("file_path")
-        if not file_path:
-            log.error("%s key: 'file_path' is required when source='file'", label)
-            sys.exit(1)
-        file_type = key_cfg.get("file_type", "hex")
-        return cls.from_file(file_path, key_type=file_type)
-
-    log.error("%s key: unknown source '%s' (expected 'env' or 'file')", label, source)
-    sys.exit(1)
-
-
-def build_operator_signer(cfg: dict) -> OperatorKeySigner:
-    return _build_signer(cfg["operator_key"], OperatorKeySigner, "OPERATOR")  # type: ignore[return-value]
-
-
-def build_trading_signer(cfg: dict) -> IntentTradingKeySigner:
-    return _build_signer(cfg["trading_key"], IntentTradingKeySigner, "TRADING")  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +132,6 @@ async def resolve_instruments(
 
     mapping: dict[str, InstrumentId] = {}
     for tok in info.tokens:
-        # Match against both the instrument id and the display symbol.
         mapping[tok.instrument.id.lower()] = tok.instrument
         if tok.instrument_symbol:
             mapping[tok.instrument_symbol.lower()] = tok.instrument
@@ -185,16 +151,8 @@ async def resolve_instruments(
 
     token_a = result[token_a_symbol.lower()]
     token_b = result[token_b_symbol.lower()]
-    log.info(
-        "Resolved  %s → admin=%.32s...",
-        token_a.id,
-        token_a.admin,
-    )
-    log.info(
-        "Resolved  %s → admin=%.32s...",
-        token_b.id,
-        token_b.admin,
-    )
+    log.info("Resolved  %s → admin=%.32s...", token_a.id, token_a.admin)
+    log.info("Resolved  %s → admin=%.32s...", token_b.id, token_b.admin)
     return token_a, token_b
 
 
@@ -208,9 +166,6 @@ async def resolve_direction(
     """
     Fetch live balances, decide the swap direction, and pick a random sell
     amount in ``[amount_min, available_balance]``.
-
-    ``token_a`` and ``token_b`` must already be real ``InstrumentId`` objects
-    resolved at startup via ``resolve_instruments``.
 
     Priority:
       1. token_a → token_b  when token_a balance >= amount_min
@@ -426,13 +381,21 @@ async def main() -> None:
 
     cfg = load_config()
 
-    operator = build_operator_signer(cfg)
-    trading = build_trading_signer(cfg)
+    # Keys from environment (populated by .env or the shell)
+    operator_hex = os.environ.get("CANTEX_OPERATOR_KEY")
+    if not operator_hex:
+        log.error("Environment variable 'CANTEX_OPERATOR_KEY' is not set")
+        sys.exit(1)
 
-    # CANTEX_BASE_URL env var takes priority over config.json
-    base_url = os.environ.get("CANTEX_BASE_URL") or cfg.get(
-        "base_url", "https://api.testnet.cantex.io"
-    )
+    trading_hex = os.environ.get("CANTEX_TRADING_KEY")
+    if not trading_hex:
+        log.error("Environment variable 'CANTEX_TRADING_KEY' is not set")
+        sys.exit(1)
+
+    operator = OperatorKeySigner.from_hex(operator_hex)
+    trading = IntentTradingKeySigner.from_hex(trading_hex)
+
+    base_url = os.environ.get("CANTEX_BASE_URL", "https://api.testnet.cantex.io")
 
     async with CantexSDK(
         operator,

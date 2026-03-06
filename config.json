@@ -1,20 +1,5 @@
 {
-  "base_url": "https://api.testnet.cantex.io",
   "api_key_path": "secrets/api_key.txt",
-
-  "operator_key": {
-    "source": "env",
-    "env_var": "CANTEX_OPERATOR_KEY",
-    "file_path": "secrets/operator.key",
-    "file_type": "hex"
-  },
-
-  "trading_key": {
-    "source": "env",
-    "env_var": "CANTEX_TRADING_KEY",
-    "file_path": "secrets/intent.key",
-    "file_type": "hex"
-  },
 
   "swap": {
     "token_a": "CC",
