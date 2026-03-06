@@ -54,10 +54,50 @@ from cantex_sdk import (
 # Logging
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
+
+class _ColoredFormatter(logging.Formatter):
+    """Colorized, timestamp-free log formatter."""
+
+    _RST = "\033[0m"
+
+    # (level-tag color, label text)
+    _STYLES: dict[int, tuple[str, str]] = {
+        logging.DEBUG: ("\033[90m", "DEBUG"),
+        logging.INFO: ("\033[96m", "INFO"),
+        logging.WARNING: ("\033[93m", "WARN"),
+        logging.ERROR: ("\033[91m", "ERROR"),
+        logging.CRITICAL: ("\033[1;91m", "CRIT"),
+    }
+
+    # message body color per level
+    _MSG_COLOR: dict[int, str] = {
+        logging.DEBUG: "\033[90m",
+        logging.INFO: "\033[97m",
+        logging.WARNING: "\033[93m",
+        logging.ERROR: "\033[91m",
+        logging.CRITICAL: "\033[1;91m",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        lc, label = self._STYLES.get(record.levelno, ("\033[97m", record.levelname[:5]))
+        mc = self._MSG_COLOR.get(record.levelno, "")
+        return f"{lc}[{label}]{self._RST}  {mc}{record.getMessage()}{self._RST}"
+
+
+def _setup_logging() -> None:
+    if sys.platform == "win32":
+        os.system("")  # enable ANSI escape codes in Windows terminals
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_ColoredFormatter())
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(handler)
+
+
+_setup_logging()
 log = logging.getLogger("cantex_bot")
 
 # ---------------------------------------------------------------------------
@@ -70,22 +110,23 @@ CONFIG_PATH = "config.json"
 def load_config(path: str = CONFIG_PATH) -> dict:
     """Load and return the bot configuration from *path*."""
     if not os.path.exists(path):
-        log.error("Configuration file not found: %s", path)
+        log.error("Config file not found  :  %s", path)
         sys.exit(1)
+
     with open(path, "r") as fh:
         cfg = json.load(fh)
 
     if "swap" not in cfg:
-        log.error("Missing required top-level key 'swap' in %s", path)
+        log.error("Missing required key 'swap' in config  (%s)", path)
         sys.exit(1)
 
     swap = cfg["swap"]
     for key in ("token_a", "token_b"):
         if key not in swap:
-            log.error("swap.%s is missing from %s", key, path)
+            log.error("Config missing field  swap.%s  (%s)", key, path)
             sys.exit(1)
         if not isinstance(swap[key], str) or not swap[key].strip():
-            log.error('swap.%s must be a non-empty string (e.g. "CC")', key)
+            log.error('swap.%s must be a non-empty string  e.g. "CC"', key)
             sys.exit(1)
 
     for field in (
@@ -95,7 +136,7 @@ def load_config(path: str = CONFIG_PATH) -> dict:
         "max_network_fee",
     ):
         if field not in swap:
-            log.error("swap.%s is missing from %s", field, path)
+            log.error("Config missing field  swap.%s  (%s)", field, path)
             sys.exit(1)
 
     return cfg
@@ -128,6 +169,7 @@ async def resolve_instruments(
 
     Exits the process with a clear error if either token is not found.
     """
+    log.info("Resolving instruments from account...")
     info = await sdk.get_account_info()
 
     mapping: dict[str, InstrumentId] = {}
@@ -141,18 +183,15 @@ async def resolve_instruments(
         match = mapping.get(symbol.lower())
         if match is None:
             available = [(t.instrument.id, t.instrument_symbol) for t in info.tokens]
-            log.error(
-                "Token '%s' not found in account. Available: %s",
-                symbol,
-                available,
-            )
+            log.error("Token not found  :  '%s'", symbol)
+            log.error("Available tokens :  %s", available)
             sys.exit(1)
         result[symbol.lower()] = match
 
     token_a = result[token_a_symbol.lower()]
     token_b = result[token_b_symbol.lower()]
-    log.info("Resolved  %s → admin=%.32s...", token_a.id, token_a.admin)
-    log.info("Resolved  %s → admin=%.32s...", token_b.id, token_b.admin)
+    log.info("%-16s  ->  admin: %.20s...", token_a.id, token_a.admin)
+    log.info("%-16s  ->  admin: %.20s...", token_b.id, token_b.admin)
     return token_a, token_b
 
 
@@ -176,40 +215,36 @@ async def resolve_direction(
     bal_a = info.get_balance(token_a)
     bal_b = info.get_balance(token_b)
 
-    log.info(
-        "Balances  %s=%s  |  %s=%s  |  min=%s",
-        token_a.id,
-        bal_a,
-        token_b.id,
-        bal_b,
-        amount_min,
-    )
+    log.info("Balances")
+    log.info("%-16s  :  %s", token_a.id, bal_a)
+    log.info("%-16s  :  %s", token_b.id, bal_b)
+    log.info("%-16s  :  %s", "Min required", amount_min)
 
     if bal_a >= amount_min:
         amount = random_amount(amount_min, bal_a, decimal_places)
-        log.info("Direction: %s → %s  (amount=%s)", token_a.id, token_b.id, amount)
+        log.info("Selling  %s  ->  %s   amount: %s", token_a.id, token_b.id, amount)
         return token_a, token_b, amount
 
     log.warning(
-        "%s balance %s is below minimum %s — checking %s for reverse swap",
+        "%s balance (%s) is below minimum (%s)  —  trying reverse swap",
         token_a.id,
         bal_a,
         amount_min,
-        token_b.id,
     )
 
     if bal_b >= amount_min:
         amount = random_amount(amount_min, bal_b, decimal_places)
         log.info(
-            "Direction (reversed): %s → %s  (amount=%s)",
+            "Selling  %s  ->  %s   amount: %s  [reversed]",
             token_b.id,
             token_a.id,
             amount,
         )
         return token_b, token_a, amount
 
+    log.error("Insufficient balance in both tokens  —  skipping cycle")
     log.error(
-        "Insufficient balance in both tokens  %s=%s  %s=%s  (minimum %s) — skipping cycle",
+        "%s: %s   |   %s: %s   |   min: %s",
         token_a.id,
         bal_a,
         token_b.id,
@@ -247,18 +282,16 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
         )
         sys.exit(1)
 
-    log.info("=" * 64)
-    log.info("Cantex Swap Bot started")
-    log.info("  Token A         : %s", token_a)
-    log.info("  Token B         : %s", token_b)
+    log.info("=" * 60)
+    log.info("Cantex Swap Bot  —  Ready")
+    log.info("%-14s  :  %s  (admin: %.16s...)", "Token A", token_a.id, token_a.admin)
+    log.info("%-14s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin)
     log.info(
-        "  Amount min      : %s  (decimal_places=%d)",
-        amount_min,
-        decimal_places,
+        "%-14s  :  %s  (%d decimal places)", "Min amount", amount_min, decimal_places
     )
-    log.info("  Interval range  : %.1f – %.1f min", interval_min, interval_max)
-    log.info("  Max network fee : %s", max_network_fee)
-    log.info("=" * 64)
+    log.info("%-14s  :  %.1f – %.1f min", "Interval", interval_min, interval_max)
+    log.info("%-14s  :  %s", "Max net fee", max_network_fee)
+    log.info("=" * 60)
 
     swap_count = 0
     fee_skips = 0
@@ -268,9 +301,8 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
     while True:
         cycle += 1
 
-        log.info("─" * 64)
         log.info(
-            "[Cycle %d]  (swaps=%d  fee_skips=%d  bal_skips=%d)",
+            "─── Cycle %d   Swaps: %d  ·  Fee Skips: %d  ·  Bal Skips: %d",
             cycle,
             swap_count,
             fee_skips,
@@ -283,19 +315,20 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
                 sdk, token_a, token_b, amount_min, decimal_places
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.warning("Could not fetch account info: %s — skipping cycle", exc)
+            log.warning("Could not fetch account info: %s  —  skipping cycle", exc)
             direction = None
 
         if direction is None:
             bal_skips += 1
             wait = random.uniform(interval_min, interval_max)
-            log.info("Waiting %.1f min before next attempt", wait)
+            log.info("Retrying in %.1f min", wait)
             await asyncio.sleep(wait * 60)
             continue
 
         sell_inst, buy_inst, actual_amount = direction
 
         # ── Step 2: get quote and apply fee guard ──────────────────────
+        log.info("Fetching swap quote...")
         try:
             quote = await sdk.get_swap_quote(
                 sell_amount=actual_amount,
@@ -303,44 +336,39 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
                 buy_instrument=buy_inst,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.warning("Quote request failed: %s — skipping cycle", exc)
+            log.warning("Quote request failed: %s  —  skipping cycle", exc)
             wait = random.uniform(interval_min, interval_max)
             await asyncio.sleep(wait * 60)
             continue
 
         network_fee = quote.fees.network_fee.amount
-        log.info(
-            "Quote  %s %s → %s %s  |  network_fee=%s  fee_pct=%s%%  slippage=%s",
-            actual_amount,
-            sell_inst.id,
-            quote.returned_amount,
-            buy_inst.id,
-            network_fee,
-            quote.fees.fee_percentage,
-            quote.slippage,
-        )
+        log.info("Quote")
+        log.info("%-12s  :  %s %s", "Sell", actual_amount, sell_inst.id)
+        log.info("%-12s  :  %s %s", "Receive", quote.returned_amount, buy_inst.id)
+        log.info("%-12s  :  %s", "Network fee", network_fee)
+        log.info("%-12s  :  %s%%", "Fee", quote.fees.fee_percentage)
+        log.info("%-12s  :  %s", "Slippage", quote.slippage)
 
         if network_fee >= max_network_fee:
             fee_skips += 1
             log.warning(
-                "Network fee %s >= threshold %s — SKIPPING swap  (fee_skips so far: %d)",
+                "Network fee %s >= threshold %s  —  swap skipped  (total fee skips: %d)",
                 network_fee,
                 max_network_fee,
                 fee_skips,
             )
             wait = random.uniform(interval_min, interval_max)
-            log.info("Waiting %.1f min before next attempt", wait)
+            log.info("Retrying in %.1f min", wait)
             await asyncio.sleep(wait * 60)
             continue
 
         # ── Step 3: execute swap ───────────────────────────────────────
         log.info(
-            "Executing swap: %s %s → %s  (fee %s < threshold %s)",
+            "Executing swap #%d  —  %s %s  ->  %s",
+            swap_count + 1,
             actual_amount,
             sell_inst.id,
             buy_inst.id,
-            network_fee,
-            max_network_fee,
         )
         try:
             result = await sdk.swap(
@@ -349,20 +377,18 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
                 buy_instrument=buy_inst,
             )
             swap_count += 1
-            log.info("Swap #%d completed: %s", swap_count, result)
+            log.info("Swap #%d complete  ->  %s", swap_count, result)
         except CantexAuthError as exc:
             log.error(
-                "Authentication error during swap (HTTP %d): %s",
-                exc.status,
-                exc.body[:200],
+                "Auth error during swap  (HTTP %d):  %s", exc.status, exc.body[:200]
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.error("Swap execution failed: %s", exc)
+            log.error("Swap failed  :  %s", exc)
 
         # ── Step 4: wait random interval ──────────────────────────────
         wait = random.uniform(interval_min, interval_max)
         log.info(
-            "Next cycle in %.1f min  (swaps=%d  fee_skips=%d  bal_skips=%d)",
+            "Next cycle in %.1f min  —  Swaps: %d  ·  Fee Skips: %d  ·  Bal Skips: %d",
             wait,
             swap_count,
             fee_skips,
@@ -403,9 +429,9 @@ async def main() -> None:
         base_url=base_url,
         api_key_path=cfg.get("api_key_path", "secrets/api_key.txt"),
     ) as sdk:
-        log.info("Authenticating...")
+        log.info("Connecting to Cantex API  (%s)", base_url)
         api_key = await sdk.authenticate()
-        log.info("Authenticated  (key prefix: %s...)", api_key[:8])
+        log.info("Authenticated  —  key: %s...", api_key[:8])
 
         await run_swap_loop(sdk, cfg)
 
