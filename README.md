@@ -51,7 +51,7 @@ See [`examples/example.py`](examples/example.py) for a more complete walkthrough
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `CANTEX_BASE_URL` | No | `https://api.testnet.cantex.io` | API base URL |
+| `CANTEX_BASE_URL` | No | `https://api.testnet.cantex.io` | API base URL (mainnet: `https://api.cantex.io`) |
 | `CANTEX_OPERATOR_KEY` | Yes | -- | Operator Ed25519 private key (hex) |
 | `CANTEX_TRADING_KEY` | No | -- | Intent trading secp256k1 private key (hex). Required for swaps and intent operations. |
 
