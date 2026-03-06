@@ -1,0 +1,31 @@
+{
+  "base_url": "https://api.testnet.cantex.io",
+  "api_key_path": "secrets/api_key.txt",
+
+  "operator_key": {
+    "source": "env",
+    "env_var": "CANTEX_OPERATOR_KEY",
+    "file_path": "secrets/operator.key",
+    "file_type": "hex"
+  },
+
+  "trading_key": {
+    "source": "env",
+    "env_var": "CANTEX_TRADING_KEY",
+    "file_path": "secrets/intent.key",
+    "file_type": "hex"
+  },
+
+  "swap": {
+    "token_a": "CC",
+    "token_b": "USDCx",
+
+    "amount_min": "10",
+    "amount_decimal_places": 6,
+
+    "interval_min_minutes": 5,
+    "interval_max_minutes": 10,
+
+    "max_network_fee": "0.1"
+  }
+}
