@@ -30,6 +30,9 @@
     "interval_min_seconds": 15,
     "interval_max_seconds": 30,
 
+    "watch_interval_min_seconds": 60,
+    "watch_interval_max_seconds": 120,
+
     "max_network_fee": "0.1"
   }
 }
