@@ -69,19 +69,9 @@ class _ColoredFormatter(logging.Formatter):
         logging.CRITICAL: ("\033[1;91m", "CRIT"),
     }
 
-    # message body color per level
-    _MSG_COLOR: dict[int, str] = {
-        logging.DEBUG: "\033[90m",
-        logging.INFO: "\033[97m",
-        logging.WARNING: "\033[93m",
-        logging.ERROR: "\033[91m",
-        logging.CRITICAL: "\033[1;91m",
-    }
-
     def format(self, record: logging.LogRecord) -> str:
         lc, label = self._STYLES.get(record.levelno, ("\033[97m", record.levelname[:5]))
-        mc = self._MSG_COLOR.get(record.levelno, "")
-        return f"{lc}[{label}]{self._RST}  {mc}{record.getMessage()}{self._RST}"
+        return f"{lc}[{label}]{self._RST}  {record.getMessage()}"
 
 
 def _setup_logging() -> None:
