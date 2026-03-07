@@ -2,14 +2,41 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 """
-Cantex SDK -- Swap / Scalp Bot
+Cantex SDK -- Swap / Scalp Bot  (multi-account edition)
 
-Reads configuration from config.json and credentials from environment
-variables (or a .env file).  Set ``"strategy"`` in config.json to pick
-which mode to run:
+────────────────────────────────────────────────────────────────────────────
+MULTI-ACCOUNT MODE  (recommended)
+────────────────────────────────────────────────────────────────────────────
+Create one sub-folder per account inside the ``accounts/`` directory:
 
-    "strategy": "swap"    -- randomised-interval swap loop (original)
-    "strategy": "scalp"   -- price-threshold scalping loop (new)
+    accounts/
+        account1/
+            config.json        ← strategy config for this account
+            .env               ← CANTEX_OPERATOR_KEY, CANTEX_TRADING_KEY
+            secrets/
+                api_key.txt
+        account2/
+            config.json
+            .env
+            secrets/
+                api_key.txt
+
+All accounts run concurrently in the same process.  Each account uses its
+own credentials and its own strategy configuration independently.  Logs are
+prefixed with a magenta [account_name] tag so you can tell them apart.
+
+────────────────────────────────────────────────────────────────────────────
+SINGLE-ACCOUNT MODE  (backward-compatible)
+────────────────────────────────────────────────────────────────────────────
+If no ``accounts/`` directory exists the bot falls back to reading
+``config.json`` and ``.env`` (or shell environment variables) from the
+project root – exactly as before.
+
+────────────────────────────────────────────────────────────────────────────
+STRATEGIES  (set ``"strategy"`` in each account's config.json)
+────────────────────────────────────────────────────────────────────────────
+  "strategy": "swap"    -- randomised-interval swap loop (original)
+  "strategy": "scalp"   -- price-threshold scalping loop (new)
 
 ────────────────────────────────────────────────────────────────────────────
 SWAP strategy
@@ -27,12 +54,11 @@ SCALP strategy
 ────────────────────────────────────────────────────────────────────────────
   - Polls the pool price every interval_min_seconds – interval_max_seconds.
   - Two-state machine: WATCHING (no position) <-> HOLDING (have token_a).
-  - BUY  when price <= buy_price_threshold and state is WATCHING.
+  - BUY  when state is WATCHING: spends full token_b balance immediately.
   - SELL when state is HOLDING and any exit condition fires (checked in order):
         1. stop-loss      price <= entry * (1 - stop_loss_pct    / 100)
         2. profit target  price >= entry * (1 + profit_target_pct / 100)
-        3. fixed ceiling  price >= sell_price_threshold
-     At least one of sell_price_threshold or profit_target_pct must be set.
+     At least one of profit_target_pct or stop_loss_pct must be set.
   - Price metric: pool_price_before_trade from a token_a -> token_b quote,
     i.e. "how many token_b per one token_a".
   - On startup a non-zero token_a balance is treated as an existing position
@@ -40,7 +66,7 @@ SCALP strategy
   - Tracks and logs realised P&L per trade and cumulatively in token_b.
 
 ────────────────────────────────────────────────────────────────────────────
-Required environment variables (or entries in a .env file):
+Required .env variables per account:
 
     CANTEX_OPERATOR_KEY   Ed25519 private key hex
     CANTEX_TRADING_KEY    secp256k1 private key hex
@@ -49,8 +75,8 @@ Optional:
 
     CANTEX_BASE_URL       API base URL (default: https://api.testnet.cantex.io)
 
-Edit config.json to configure instruments, amounts, thresholds, intervals,
-and the fee threshold, then run:
+Edit each account's config.json to configure instruments, amounts,
+thresholds, intervals, and the fee threshold, then run:
 
     python main.py
 """
@@ -63,7 +89,7 @@ import random
 import sys
 from decimal import ROUND_DOWN, Decimal
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from cantex_sdk import (
     CantexAPIError,
@@ -81,9 +107,10 @@ from cantex_sdk import (
 
 
 class _ColoredFormatter(logging.Formatter):
-    """Colorized, timestamp-free log formatter."""
+    """Colorized, timestamp-free log formatter with optional account prefix."""
 
     _RST = "\033[0m"
+    _ACC = "\033[35m"  # magenta for the [account] tag
 
     _STYLES: dict[int, tuple[str, str]] = {
         logging.DEBUG: ("\033[90m", "DEBUG"),
@@ -95,7 +122,12 @@ class _ColoredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         lc, label = self._STYLES.get(record.levelno, ("\033[97m", record.levelname[:5]))
-        return f"{lc}[{label}]{self._RST}  {record.getMessage()}"
+        # "cantex_bot.account1" -> show "[account1]" prefix; "cantex_bot" -> no prefix
+        parts = record.name.split(".", 1)
+        account_prefix = (
+            f"  {self._ACC}[{parts[1]}]{self._RST}" if len(parts) > 1 else ""
+        )
+        return f"{lc}[{label}]{self._RST}{account_prefix}  {record.getMessage()}"
 
 
 def _setup_logging() -> None:
@@ -119,88 +151,61 @@ log = logging.getLogger("cantex_bot")
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = "config.json"
+ACCOUNTS_DIR = "accounts"
 _VALID_STRATEGIES = ("swap", "scalp")
 
 
-def _require_fields(
-    section: dict,
-    prefix: str,
-    fields: tuple[str, ...],
-    path: str,
-) -> None:
-    """Exit with a clear message if any of *fields* are absent from *section*."""
-    for field in fields:
-        if field not in section:
-            log.error("Config missing field  %s.%s  (%s)", prefix, field, path)
+def _require_fields(cfg: dict, keys: list[str], section: str, path: str) -> None:
+    for key in keys:
+        if key not in cfg:
+            log.error("Missing required key '%s' in [%s]  (%s)", key, section, path)
             sys.exit(1)
 
 
-def _require_token_fields(section: dict, prefix: str, path: str) -> None:
-    """Validate that token_a / token_b are present and non-empty strings."""
-    for key in ("token_a", "token_b"):
-        if key not in section:
-            log.error("Config missing field  %s.%s  (%s)", prefix, key, path)
-            sys.exit(1)
-        if not isinstance(section[key], str) or not section[key].strip():
-            log.error(
-                'Config  %s.%s  must be a non-empty string  e.g. "CC"', prefix, key
-            )
-            sys.exit(1)
+def _require_token_fields(cfg: dict, section: str, path: str) -> None:
+    _require_fields(cfg, ["token_a", "token_b"], section, path)
 
 
-def _validate_swap_config(swap: dict, path: str) -> None:
-    _require_token_fields(swap, "swap", path)
-    _require_fields(
-        swap,
-        "swap",
-        (
-            "amount_min",
-            "interval_min_minutes",
-            "interval_max_minutes",
-            "max_network_fee",
-        ),
-        path,
-    )
-    iv_min = float(swap["interval_min_minutes"])
-    iv_max = float(swap["interval_max_minutes"])
-    if iv_min > iv_max:
-        log.error(
-            "swap.interval_min_minutes (%s) must be <= interval_max_minutes (%s)",
-            iv_min,
-            iv_max,
-        )
+def _validate_swap_config(swap_cfg: dict, path: str) -> None:
+    required = [
+        "token_a",
+        "token_b",
+        "amount_min",
+        "interval_min_minutes",
+        "interval_max_minutes",
+        "max_network_fee",
+    ]
+    _require_fields(swap_cfg, required, "swap", path)
+    if float(swap_cfg["interval_min_minutes"]) > float(
+        swap_cfg["interval_max_minutes"]
+    ):
+        log.error("swap.interval_min_minutes > swap.interval_max_minutes  (%s)", path)
         sys.exit(1)
 
 
-def _validate_scalp_config(scalp: dict, path: str) -> None:
-    _require_token_fields(scalp, "scalp", path)
-    _require_fields(
-        scalp,
-        "scalp",
-        (
-            "max_network_fee",
-            "interval_min_seconds",
-            "interval_max_seconds",
-        ),
-        path,
-    )
+def _validate_scalp_config(scalp_cfg: dict, path: str) -> None:
+    required = [
+        "token_a",
+        "token_b",
+        "max_network_fee",
+        "interval_min_seconds",
+        "interval_max_seconds",
+    ]
+    _require_fields(scalp_cfg, required, "scalp", path)
 
-    iv_min = float(scalp["interval_min_seconds"])
-    iv_max = float(scalp["interval_max_seconds"])
-    if iv_min > iv_max:
-        log.error(
-            "scalp.interval_min_seconds (%s) must be <= interval_max_seconds (%s)",
-            iv_min,
-            iv_max,
-        )
+    if float(scalp_cfg["interval_min_seconds"]) > float(
+        scalp_cfg["interval_max_seconds"]
+    ):
+        log.error("scalp.interval_min_seconds > scalp.interval_max_seconds  (%s)", path)
         sys.exit(1)
 
-    has_profit_target = Decimal(str(scalp.get("profit_target_pct", "0"))) > 0
-    has_stop_loss = Decimal(str(scalp.get("stop_loss_pct", "0"))) > 0
-    if not has_profit_target and not has_stop_loss:
+    profit_target = Decimal(str(scalp_cfg.get("profit_target_pct", "0")))
+    stop_loss = Decimal(str(scalp_cfg.get("stop_loss_pct", "0")))
+    if profit_target <= 0 and stop_loss <= 0:
         log.error(
-            "scalp config requires at least one of: "
-            "'profit_target_pct' (non-zero) or 'stop_loss_pct' (non-zero)"
+            "scalp config must set at least one of 'profit_target_pct' or "
+            "'stop_loss_pct' to a positive value  (%s)",
+            path,
         )
         sys.exit(1)
 
@@ -263,6 +268,8 @@ async def resolve_instruments(
     sdk: CantexSDK,
     token_a_symbol: str,
     token_b_symbol: str,
+    *,
+    account_log: logging.Logger = log,
 ) -> tuple[InstrumentId, InstrumentId]:
     """
     Fetch real ``InstrumentId`` objects from the live API by matching token
@@ -270,7 +277,7 @@ async def resolve_instruments(
 
     Exits the process with a clear error if either token is not found.
     """
-    log.info("Resolving instruments from account...")
+    account_log.info("Resolving instruments from account...")
     info = await sdk.get_account_info()
 
     mapping: dict[str, InstrumentId] = {}
@@ -284,15 +291,15 @@ async def resolve_instruments(
         match = mapping.get(symbol.lower())
         if match is None:
             available = [(t.instrument.id, t.instrument_symbol) for t in info.tokens]
-            log.error("Token not found  :  '%s'", symbol)
-            log.error("Available tokens :  %s", available)
+            account_log.error("Token not found  :  '%s'", symbol)
+            account_log.error("Available tokens :  %s", available)
             sys.exit(1)
         result[symbol.lower()] = match
 
     token_a = result[token_a_symbol.lower()]
     token_b = result[token_b_symbol.lower()]
-    log.info("%-16s  ->  admin: %.20s...", token_a.id, token_a.admin)
-    log.info("%-16s  ->  admin: %.20s...", token_b.id, token_b.admin)
+    account_log.info("%-16s  ->  admin: %.20s...", token_a.id, token_a.admin)
+    account_log.info("%-16s  ->  admin: %.20s...", token_b.id, token_b.admin)
     return token_a, token_b
 
 
@@ -307,6 +314,8 @@ async def resolve_direction(
     token_b: InstrumentId,
     amount_min: Decimal,
     decimal_places: int,
+    *,
+    account_log: logging.Logger = log,
 ) -> tuple[InstrumentId, InstrumentId, Decimal] | None:
     """
     Fetch live balances, decide the swap direction, and pick a random sell
@@ -321,17 +330,19 @@ async def resolve_direction(
     bal_a = info.get_balance(token_a)
     bal_b = info.get_balance(token_b)
 
-    log.info("Balances")
-    log.info("%-16s  :  %s", token_a.id, bal_a)
-    log.info("%-16s  :  %s", token_b.id, bal_b)
-    log.info("%-16s  :  %s", "Min required", amount_min)
+    account_log.info("Balances")
+    account_log.info("%-16s  :  %s", token_a.id, bal_a)
+    account_log.info("%-16s  :  %s", token_b.id, bal_b)
+    account_log.info("%-16s  :  %s", "Min required", amount_min)
 
     if bal_a >= amount_min:
         amount = random_amount(amount_min, bal_a, decimal_places)
-        log.info("Selling  %s  ->  %s   amount: %s", token_a.id, token_b.id, amount)
+        account_log.info(
+            "Selling  %s  ->  %s   amount: %s", token_a.id, token_b.id, amount
+        )
         return token_a, token_b, amount
 
-    log.warning(
+    account_log.warning(
         "%s balance (%s) is below minimum (%s)  —  trying reverse swap",
         token_a.id,
         bal_a,
@@ -340,7 +351,7 @@ async def resolve_direction(
 
     if bal_b >= amount_min:
         amount = random_amount(amount_min, bal_b, decimal_places)
-        log.info(
+        account_log.info(
             "Selling  %s  ->  %s   amount: %s  [reversed]",
             token_b.id,
             token_a.id,
@@ -348,8 +359,8 @@ async def resolve_direction(
         )
         return token_b, token_a, amount
 
-    log.error("Insufficient balance in both tokens  —  skipping cycle")
-    log.error(
+    account_log.error("Insufficient balance in both tokens  —  skipping cycle")
+    account_log.error(
         "%s: %s   |   %s: %s   |   min: %s",
         token_a.id,
         bal_a,
@@ -365,13 +376,19 @@ async def resolve_direction(
 # ---------------------------------------------------------------------------
 
 
-async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
+async def run_swap_loop(
+    sdk: CantexSDK,
+    cfg: dict,
+    *,
+    account_log: logging.Logger = log,
+) -> None:
     swap_cfg = cfg["swap"]
 
     token_a, token_b = await resolve_instruments(
         sdk,
         swap_cfg["token_a"],
         swap_cfg["token_b"],
+        account_log=account_log,
     )
 
     amount_min = Decimal(str(swap_cfg["amount_min"]))
@@ -380,16 +397,22 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
     interval_max = float(swap_cfg["interval_max_minutes"])
     max_network_fee = Decimal(str(swap_cfg["max_network_fee"]))
 
-    log.info("=" * 60)
-    log.info("Cantex Swap Bot  —  Ready")
-    log.info("%-14s  :  %s  (admin: %.16s...)", "Token A", token_a.id, token_a.admin)
-    log.info("%-14s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin)
-    log.info(
+    account_log.info("=" * 60)
+    account_log.info("Cantex Swap Bot  —  Ready")
+    account_log.info(
+        "%-14s  :  %s  (admin: %.16s...)", "Token A", token_a.id, token_a.admin
+    )
+    account_log.info(
+        "%-14s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin
+    )
+    account_log.info(
         "%-14s  :  %s  (%d decimal places)", "Min amount", amount_min, decimal_places
     )
-    log.info("%-14s  :  %.1f – %.1f min", "Interval", interval_min, interval_max)
-    log.info("%-14s  :  %s", "Max net fee", max_network_fee)
-    log.info("=" * 60)
+    account_log.info(
+        "%-14s  :  %.1f – %.1f min", "Interval", interval_min, interval_max
+    )
+    account_log.info("%-14s  :  %s", "Max net fee", max_network_fee)
+    account_log.info("=" * 60)
 
     swap_count = 0
     fee_skips = 0
@@ -399,7 +422,7 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
     while True:
         cycle += 1
 
-        log.info(
+        account_log.info(
             "─── Cycle %d   Swaps: %d  ·  Fee Skips: %d  ·  Bal Skips: %d",
             cycle,
             swap_count,
@@ -410,23 +433,30 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
         # ── Step 1: resolve direction and amount from live balances ────
         try:
             direction = await resolve_direction(
-                sdk, token_a, token_b, amount_min, decimal_places
+                sdk,
+                token_a,
+                token_b,
+                amount_min,
+                decimal_places,
+                account_log=account_log,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.warning("Could not fetch account info: %s  —  skipping cycle", exc)
+            account_log.warning(
+                "Could not fetch account info: %s  —  skipping cycle", exc
+            )
             direction = None
 
         if direction is None:
             bal_skips += 1
             wait = random.uniform(interval_min, interval_max)
-            log.info("Retrying in %.1f min", wait)
+            account_log.info("Retrying in %.1f min", wait)
             await asyncio.sleep(wait * 60)
             continue
 
         sell_inst, buy_inst, actual_amount = direction
 
         # ── Step 2: get quote and apply fee guard ──────────────────────
-        log.info("Fetching swap quote...")
+        account_log.info("Fetching swap quote...")
         try:
             quote = await sdk.get_swap_quote(
                 sell_amount=actual_amount,
@@ -434,34 +464,36 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
                 buy_instrument=buy_inst,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.warning("Quote request failed: %s  —  skipping cycle", exc)
+            account_log.warning("Quote request failed: %s  —  skipping cycle", exc)
             wait = random.uniform(interval_min, interval_max)
             await asyncio.sleep(wait * 60)
             continue
 
         network_fee = quote.fees.network_fee.amount
-        log.info("Quote")
-        log.info("%-12s  :  %s %s", "Sell", actual_amount, sell_inst.id)
-        log.info("%-12s  :  %s %s", "Receive", quote.returned_amount, buy_inst.id)
-        log.info("%-12s  :  %s", "Network fee", network_fee)
-        log.info("%-12s  :  %s%%", "Fee", quote.fees.fee_percentage)
-        log.info("%-12s  :  %s", "Slippage", quote.slippage)
+        account_log.info("Quote")
+        account_log.info("%-12s  :  %s %s", "Sell", actual_amount, sell_inst.id)
+        account_log.info(
+            "%-12s  :  %s %s", "Receive", quote.returned_amount, buy_inst.id
+        )
+        account_log.info("%-12s  :  %s", "Network fee", network_fee)
+        account_log.info("%-12s  :  %s%%", "Fee", quote.fees.fee_percentage)
+        account_log.info("%-12s  :  %s", "Slippage", quote.slippage)
 
         if network_fee >= max_network_fee:
             fee_skips += 1
-            log.warning(
+            account_log.warning(
                 "Network fee %s >= threshold %s  —  swap skipped  (total fee skips: %d)",
                 network_fee,
                 max_network_fee,
                 fee_skips,
             )
             wait = random.uniform(interval_min, interval_max)
-            log.info("Retrying in %.1f min", wait)
+            account_log.info("Retrying in %.1f min", wait)
             await asyncio.sleep(wait * 60)
             continue
 
         # ── Step 3: execute swap ───────────────────────────────────────
-        log.info(
+        account_log.info(
             "Executing swap #%d  —  %s %s  ->  %s",
             swap_count + 1,
             actual_amount,
@@ -475,17 +507,17 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
                 buy_instrument=buy_inst,
             )
             swap_count += 1
-            log.info("Swap #%d complete  ->  %s", swap_count, result)
+            account_log.info("Swap #%d complete  ->  %s", swap_count, result)
         except CantexAuthError as exc:
-            log.error(
+            account_log.error(
                 "Auth error during swap  (HTTP %d):  %s", exc.status, exc.body[:200]
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.error("Swap failed  :  %s", exc)
+            account_log.error("Swap failed  :  %s", exc)
 
         # ── Step 4: wait random interval ──────────────────────────────
         wait = random.uniform(interval_min, interval_max)
-        log.info(
+        account_log.info(
             "Next cycle in %.1f min  —  Swaps: %d  ·  Fee Skips: %d  ·  Bal Skips: %d",
             wait,
             swap_count,
@@ -500,7 +532,12 @@ async def run_swap_loop(sdk: CantexSDK, cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
+async def run_scalp_loop(
+    sdk: CantexSDK,
+    cfg: dict,
+    *,
+    account_log: logging.Logger = log,
+) -> None:
     """
     Scalping strategy: always holds a position in token_a and manages it
     with a profit target and/or stop-loss. No price threshold is needed to
@@ -543,6 +580,7 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
         sdk,
         scalp_cfg["token_a"],
         scalp_cfg["token_b"],
+        account_log=account_log,
     )
 
     decimal_places = int(scalp_cfg.get("amount_decimal_places", 6))
@@ -562,13 +600,13 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
     )
 
     # ── Detect initial position; rebase entry_price if already holding ─
-    log.info("Checking initial balances for position state...")
+    account_log.info("Checking initial balances for position state...")
     try:
         init_info = await sdk.get_account_info()
         init_bal_a = init_info.get_balance(token_a)
         init_bal_b = init_info.get_balance(token_b)
     except (CantexAPIError, CantexTimeoutError) as exc:
-        log.error("Failed to fetch initial account info: %s", exc)
+        account_log.error("Failed to fetch initial account info: %s", exc)
         sys.exit(1)
 
     holding: bool = init_bal_a >= min_position
@@ -583,16 +621,24 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
     cycle = 0
 
     # ── Summary banner ─────────────────────────────────────────────────
-    log.info("=" * 60)
-    log.info("Cantex Scalp Bot  —  Ready")
-    log.info("%-22s  :  %s  (admin: %.16s...)", "Token A", token_a.id, token_a.admin)
-    log.info("%-22s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin)
-    log.info("%-22s  :  %s%%", "Profit target", profit_target_pct or "—  (disabled)")
-    log.info("%-22s  :  %s%%", "Stop loss", stop_loss_pct or "—  (disabled)")
-    log.info("%-22s  :  %.1f – %.1f sec", "Interval", interval_min, interval_max)
-    log.info("%-22s  :  %s", "Max net fee", max_network_fee)
-    log.info("%-22s  :  %s", "Min position", min_position)
-    log.info(
+    account_log.info("=" * 60)
+    account_log.info("Cantex Scalp Bot  —  Ready")
+    account_log.info(
+        "%-22s  :  %s  (admin: %.16s...)", "Token A", token_a.id, token_a.admin
+    )
+    account_log.info(
+        "%-22s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin
+    )
+    account_log.info(
+        "%-22s  :  %s%%", "Profit target", profit_target_pct or "—  (disabled)"
+    )
+    account_log.info("%-22s  :  %s%%", "Stop loss", stop_loss_pct or "—  (disabled)")
+    account_log.info(
+        "%-22s  :  %.1f – %.1f sec", "Interval", interval_min, interval_max
+    )
+    account_log.info("%-22s  :  %s", "Max net fee", max_network_fee)
+    account_log.info("%-22s  :  %s", "Min position", min_position)
+    account_log.info(
         "%-22s  :  %s  (%s %s  |  %s %s)",
         "Initial balances",
         "HOLDING" if holding else "WATCHING",
@@ -601,15 +647,12 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
         init_bal_b,
         token_b.id,
     )
-    log.info("=" * 60)
+    account_log.info("=" * 60)
 
     while True:
         cycle += 1
 
         # ── Step 1: consistent price probe (1 token_a -> token_b) ─────
-        # Using a fixed direction and amount every cycle means entry_price
-        # and current_price are always in the same units (token_b per token_a)
-        # and can be compared directly.
         try:
             probe = await sdk.get_swap_quote(
                 sell_amount=Decimal("1"),
@@ -617,7 +660,9 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                 buy_instrument=token_b,
             )
         except (CantexAPIError, CantexTimeoutError) as exc:
-            log.warning("Price probe failed: %s  —  retrying after interval", exc)
+            account_log.warning(
+                "Price probe failed: %s  —  retrying after interval", exc
+            )
             await asyncio.sleep(random.uniform(interval_min, interval_max))
             continue
 
@@ -626,13 +671,13 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
         # ── Rebase entry_price on the first cycle when already holding ─
         if holding and entry_price is None:
             entry_price = current_price
-            log.warning(
+            account_log.warning(
                 "Existing %s position detected  —  rebasing entry price to "
                 "current pool price: %s",
                 token_a.id,
                 entry_price,
             )
-            log.warning(
+            account_log.warning(
                 "Exit levels are now relative to the rebase price, "
                 "not the original purchase price."
             )
@@ -649,7 +694,7 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
             else "—"
         )
 
-        log.info(
+        account_log.info(
             "─── Cycle %d  ·  Price: %s  ·  %s  "
             "·  Buys: %d  ·  Sells: %d  ·  P&L: %s %s",
             cycle,
@@ -670,14 +715,14 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                 info = await sdk.get_account_info()
                 bal_b = info.get_balance(token_b)
             except (CantexAPIError, CantexTimeoutError) as exc:
-                log.warning("Balance check failed: %s  —  retrying", exc)
+                account_log.warning("Balance check failed: %s  —  retrying", exc)
                 await asyncio.sleep(random.uniform(interval_min, interval_max))
                 continue
 
             buy_amount = _quantize(bal_b, decimal_places)
 
             if buy_amount <= 0:
-                log.warning(
+                account_log.warning(
                     "No %s balance to enter with  —  waiting",
                     token_b.id,
                 )
@@ -692,36 +737,28 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                     buy_instrument=token_a,
                 )
             except (CantexAPIError, CantexTimeoutError) as exc:
-                log.warning("Buy quote failed: %s  —  retrying", exc)
+                account_log.warning("Buy quote failed: %s  --  retrying", exc)
                 await asyncio.sleep(random.uniform(interval_min, interval_max))
                 continue
 
             buy_fee = buy_quote.fees.network_fee.amount
-            log.info(
+            account_log.info(
                 "Buy quote  |  spend: %s %s  ->  ~%s %s  |  fee: %s  |  slippage: %s",
-                buy_amount,
-                token_b.id,
-                buy_quote.returned_amount,
-                token_a.id,
-                buy_fee,
-                buy_quote.slippage,
+                buy_amount, token_b.id,
+                buy_quote.returned_amount, token_a.id,
+                buy_fee, buy_quote.slippage,
             )
 
             if buy_fee >= max_network_fee:
                 fee_skips += 1
-                log.warning(
-                    "Buy fee %s >= max %s  —  skipping entry  (fee skips: %d)",
-                    buy_fee,
-                    max_network_fee,
-                    fee_skips,
+                account_log.warning(
+                    "Buy fee %s >= max %s  --  skipping entry  (fee skips: %d)",
+                    buy_fee, max_network_fee, fee_skips,
                 )
             else:
-                log.info(
-                    "Entering position #%d  —  spending %s %s  ->  %s",
-                    buy_count + 1,
-                    buy_amount,
-                    token_b.id,
-                    token_a.id,
+                account_log.info(
+                    "Entering position #%d  --  spending %s %s  ->  %s",
+                    buy_count + 1, buy_amount, token_b.id, token_a.id,
                 )
                 try:
                     result = await sdk.swap(
@@ -729,36 +766,30 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                         sell_instrument=token_b,
                         buy_instrument=token_a,
                     )
-                    buy_count += 1
-                    entry_price = current_price
+                    buy_count   += 1
+                    entry_price  = current_price
                     entry_cost_b = buy_amount
-                    holding = True
-                    log.info("BUY #%d complete  ->  %s", buy_count, result)
-                    log.info(
-                        "Entry price: %s  |  Cost: %s %s  "
-                        "|  Profit target: %s  |  Stop loss: %s",
-                        entry_price,
-                        entry_cost_b,
-                        token_b.id,
-                        profit_level,
-                        stop_level,
+                    holding      = True
+                    account_log.info("BUY #%d complete  ->  %s", buy_count, result)
+                    account_log.info(
+                        "Entry price: %s  |  Cost: %s %s  |  Target: %s  |  Stop: %s",
+                        entry_price, entry_cost_b, token_b.id,
+                        profit_level, stop_level,
                     )
                 except CantexAuthError as exc:
-                    log.error(
-                        "Auth error on BUY  (HTTP %d):  %s",
-                        exc.status,
-                        exc.body[:200],
+                    account_log.error(
+                        "Auth error on BUY  (HTTP %d):  %s", exc.status, exc.body[:200]
                     )
                 except (CantexAPIError, CantexTimeoutError) as exc:
-                    log.error("BUY failed  :  %s", exc)
+                    account_log.error("BUY failed  :  %s", exc)
 
-        # ══════════════════════════════════════════════════════════════
-        # Path B — HOLDING: watch price, exit on profit target or stop-loss
-        # ══════════════════════════════════════════════════════════════
+        # ================================================================
+        # Path B -- HOLDING: watch price, exit on stop-loss or profit target
+        # ================================================================
         else:
             sell_reason: str | None = None
 
-            # 1. Stop-loss — checked first (highest urgency)
+            # 1. Stop-loss (highest urgency)
             if stop_loss_pct is not None and entry_price is not None:
                 floor = entry_price * (1 - stop_loss_pct / Decimal("100"))
                 if current_price <= floor:
@@ -781,36 +812,31 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                     )
 
             if sell_reason is None:
-                log.info(
-                    "Holding  —  price: %s  |  entry: %s  |  target: %s  |  stop: %s",
-                    current_price,
-                    entry_price,
-                    profit_level,
-                    stop_level,
+                account_log.info(
+                    "Holding  --  price: %s  |  entry: %s  |  target: %s  |  stop: %s",
+                    current_price, entry_price, profit_level, stop_level,
                 )
             else:
-                log.info("SELL signal  —  %s", sell_reason)
+                account_log.info("SELL signal  --  %s", sell_reason)
 
                 # Fetch live token_a balance to sell the full position
                 try:
-                    info = await sdk.get_account_info()
+                    info  = await sdk.get_account_info()
                     bal_a = info.get_balance(token_a)
                 except (CantexAPIError, CantexTimeoutError) as exc:
-                    log.warning(
-                        "Balance check failed: %s  —  holding, retrying next cycle",
-                        exc,
+                    account_log.warning(
+                        "Balance check failed: %s  --  holding, retrying next cycle", exc
                     )
                     await asyncio.sleep(random.uniform(interval_min, interval_max))
                     continue
 
                 if bal_a < min_position:
-                    log.warning(
-                        "%s balance too low to sell (%s)  —  resetting state",
-                        token_a.id,
-                        bal_a,
+                    account_log.warning(
+                        "%s balance too low to sell (%s)  --  resetting state",
+                        token_a.id, bal_a,
                     )
-                    holding = False
-                    entry_price = None
+                    holding      = False
+                    entry_price  = None
                     entry_cost_b = None
                 else:
                     sell_amt = _quantize(bal_a, decimal_places)
@@ -822,39 +848,30 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                             buy_instrument=token_b,
                         )
                     except (CantexAPIError, CantexTimeoutError) as exc:
-                        log.warning(
-                            "Sell quote failed: %s  —  holding, retrying next cycle",
-                            exc,
+                        account_log.warning(
+                            "Sell quote failed: %s  --  holding, retrying next cycle", exc
                         )
                         await asyncio.sleep(random.uniform(interval_min, interval_max))
                         continue
 
                     sell_fee = sell_quote.fees.network_fee.amount
-                    log.info(
+                    account_log.info(
                         "Sell quote  |  sell: %s %s  ->  ~%s %s  |  fee: %s  |  slippage: %s",
-                        sell_amt,
-                        token_a.id,
-                        sell_quote.returned_amount,
-                        token_b.id,
-                        sell_fee,
-                        sell_quote.slippage,
+                        sell_amt, token_a.id,
+                        sell_quote.returned_amount, token_b.id,
+                        sell_fee, sell_quote.slippage,
                     )
 
                     if sell_fee >= max_network_fee:
                         fee_skips += 1
-                        log.warning(
-                            "Sell fee %s >= max %s  —  holding  (fee skips: %d)",
-                            sell_fee,
-                            max_network_fee,
-                            fee_skips,
+                        account_log.warning(
+                            "Sell fee %s >= max %s  --  holding  (fee skips: %d)",
+                            sell_fee, max_network_fee, fee_skips,
                         )
                     else:
-                        log.info(
-                            "Executing SELL #%d  —  %s %s  ->  %s",
-                            sell_count + 1,
-                            sell_amt,
-                            token_a.id,
-                            token_b.id,
+                        account_log.info(
+                            "Executing SELL #%d  --  %s %s  ->  %s",
+                            sell_count + 1, sell_amt, token_a.id, token_b.id,
                         )
                         try:
                             result = await sdk.swap(
@@ -864,49 +881,144 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
                             )
                             sell_count += 1
 
-                            # ── P&L ────────────────────────────────────
+                            # P&L
                             received_b = sell_quote.returned_amount
                             if entry_cost_b is not None:
-                                trade_pnl = received_b - entry_cost_b
+                                trade_pnl           = received_b - entry_cost_b
                                 total_realized_pnl += trade_pnl
                                 sign = "+" if trade_pnl >= 0 else ""
-                                log.info(
+                                account_log.info(
                                     "SELL #%d complete  ->  %s", sell_count, result
                                 )
-                                log.info(
+                                account_log.info(
                                     "Trade P&L: %s%s %s  |  Cumulative P&L: %s %s",
-                                    sign,
-                                    trade_pnl,
-                                    token_b.id,
-                                    total_realized_pnl,
-                                    token_b.id,
+                                    sign, trade_pnl, token_b.id,
+                                    total_realized_pnl, token_b.id,
                                 )
                             else:
-                                log.info(
+                                account_log.info(
                                     "SELL #%d complete  ->  %s  "
-                                    "(P&L unknown — no recorded entry cost)",
-                                    sell_count,
-                                    result,
+                                    "(P&L unknown -- no recorded entry cost)",
+                                    sell_count, result,
                                 )
 
-                            # Reset state; next cycle will immediately re-enter
-                            holding = False
-                            entry_price = None
+                            # Reset state; next cycle re-enters immediately
+                            holding      = False
+                            entry_price  = None
                             entry_cost_b = None
 
                         except CantexAuthError as exc:
-                            log.error(
+                            account_log.error(
                                 "Auth error on SELL  (HTTP %d):  %s",
-                                exc.status,
-                                exc.body[:200],
+                                exc.status, exc.body[:200],
                             )
                         except (CantexAPIError, CantexTimeoutError) as exc:
-                            log.error("SELL failed  :  %s", exc)
+                            account_log.error("SELL failed  :  %s", exc)
 
-        # ── Wait before next poll ──────────────────────────────────────
+        # Wait before next poll
         wait = random.uniform(interval_min, interval_max)
-        log.info("Next poll in %.1fs", wait)
+        account_log.info("Next poll in %.1fs", wait)
         await asyncio.sleep(wait)
+
+
+# ---------------------------------------------------------------------------
+# Multi-account support
+# ---------------------------------------------------------------------------
+
+
+def discover_accounts() -> list[tuple[str, str]]:
+    """
+    Scan the ``accounts/`` directory and return [(name, abs_path), ...] for
+    every immediate sub-folder found, sorted alphabetically by name.
+
+    Returns an empty list when the directory does not exist, so callers can
+    fall back to single-account mode transparently.
+    """
+    if not os.path.isdir(ACCOUNTS_DIR):
+        return []
+    entries = []
+    for entry in os.scandir(ACCOUNTS_DIR):
+        if entry.is_dir():
+            entries.append((entry.name, os.path.abspath(entry.path)))
+    entries.sort(key=lambda t: t[0])
+    return entries
+
+
+async def run_account(account_name: str, account_dir: str) -> None:
+    """
+    Bootstrap and run the full bot loop for a single account.
+
+    Credentials are loaded from ``<account_dir>/.env`` using
+    ``dotenv_values()`` (returns a plain dict, never touches ``os.environ``)
+    so multiple accounts running concurrently cannot overwrite each other's
+    keys.
+
+    Strategy config is loaded from ``<account_dir>/config.json``.
+
+    The ``api_key_path`` in config.json is resolved relative to
+    ``account_dir`` when it is not an absolute path.
+    """
+    account_log = logging.getLogger(f"cantex_bot.{account_name}")
+
+    # --- credentials -------------------------------------------------------
+    env_path = os.path.join(account_dir, ".env")
+    env      = dotenv_values(env_path)          # dict, no os.environ side-effects
+
+    operator_hex = env.get("CANTEX_OPERATOR_KEY") or os.environ.get("CANTEX_OPERATOR_KEY")
+    trading_hex  = env.get("CANTEX_TRADING_KEY")  or os.environ.get("CANTEX_TRADING_KEY")
+    base_url     = (
+        env.get("CANTEX_BASE_URL")
+        or os.environ.get("CANTEX_BASE_URL")
+        or "https://api.testnet.cantex.io"
+    )
+
+    if not operator_hex:
+        account_log.error("CANTEX_OPERATOR_KEY is not set  (checked %s and env)", env_path)
+        return
+    if not trading_hex:
+        account_log.error("CANTEX_TRADING_KEY is not set  (checked %s and env)", env_path)
+        return
+
+    # --- config ------------------------------------------------------------
+    config_path = os.path.join(account_dir, "config.json")
+    cfg = load_config(config_path)
+
+    # Resolve api_key_path relative to account_dir when not absolute
+    raw_key_path = cfg.get("api_key_path", "secrets/api_key.txt")
+    api_key_path = (
+        raw_key_path if os.path.isabs(raw_key_path)
+        else os.path.join(account_dir, raw_key_path)
+    )
+
+    # --- run ---------------------------------------------------------------
+    operator = OperatorKeySigner.from_hex(operator_hex)
+    trading  = IntentTradingKeySigner.from_hex(trading_hex)
+
+    async with CantexSDK(
+        operator,
+        trading,
+        base_url=base_url,
+        api_key_path=api_key_path,
+    ) as sdk:
+        account_log.info("Connecting to Cantex API  (%s)", base_url)
+        try:
+            api_key = await sdk.authenticate()
+        except (CantexAuthError, CantexAPIError, CantexTimeoutError) as exc:
+            account_log.error("Authentication failed  :  %s", exc)
+            return
+
+        account_log.info("Authenticated  --  key: %s...", api_key[:8])
+
+        strategy = cfg.get("strategy", "swap")
+        account_log.info("Strategy  :  %s", strategy)
+
+        try:
+            if strategy == "swap":
+                await run_swap_loop(sdk, cfg, account_log=account_log)
+            elif strategy == "scalp":
+                await run_scalp_loop(sdk, cfg, account_log=account_log)
+        except Exception as exc:  # noqa: BLE001
+            account_log.error("Unhandled error in strategy loop  :  %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -915,43 +1027,60 @@ async def run_scalp_loop(sdk: CantexSDK, cfg: dict) -> None:
 
 
 async def main() -> None:
-    load_dotenv()
+    accounts = discover_accounts()
 
-    cfg = load_config()
+    if accounts:
+        # ── Multi-account mode ─────────────────────────────────────────
+        log.info("Multi-account mode  --  %d account(s) found:", len(accounts))
+        for name, path in accounts:
+            log.info("  %-20s  ->  %s", name, path)
 
-    # Keys from environment (populated by .env or the shell)
-    operator_hex = os.environ.get("CANTEX_OPERATOR_KEY")
-    if not operator_hex:
-        log.error("Environment variable 'CANTEX_OPERATOR_KEY' is not set")
-        sys.exit(1)
+        results = await asyncio.gather(
+            *[run_account(name, path) for name, path in accounts],
+            return_exceptions=True,
+        )
+        for (name, _), result in zip(accounts, results):
+            if isinstance(result, BaseException):
+                log.error("Account '%s' raised an unhandled exception: %s", name, result)
+    else:
+        # ── Single-account mode (backward-compatible) ──────────────────
+        log.info("No accounts/ directory found  --  running in single-account mode")
+        load_dotenv()
 
-    trading_hex = os.environ.get("CANTEX_TRADING_KEY")
-    if not trading_hex:
-        log.error("Environment variable 'CANTEX_TRADING_KEY' is not set")
-        sys.exit(1)
+        operator_hex = os.environ.get("CANTEX_OPERATOR_KEY")
+        if not operator_hex:
+            log.error("Environment variable 'CANTEX_OPERATOR_KEY' is not set")
+            sys.exit(1)
 
-    operator = OperatorKeySigner.from_hex(operator_hex)
-    trading = IntentTradingKeySigner.from_hex(trading_hex)
+        trading_hex = os.environ.get("CANTEX_TRADING_KEY")
+        if not trading_hex:
+            log.error("Environment variable 'CANTEX_TRADING_KEY' is not set")
+            sys.exit(1)
 
-    base_url = os.environ.get("CANTEX_BASE_URL", "https://api.testnet.cantex.io")
+        operator = OperatorKeySigner.from_hex(operator_hex)
+        trading  = IntentTradingKeySigner.from_hex(trading_hex)
+        base_url = os.environ.get("CANTEX_BASE_URL", "https://api.testnet.cantex.io")
 
-    async with CantexSDK(
-        operator,
-        trading,
-        base_url=base_url,
-        api_key_path=cfg.get("api_key_path", "secrets/api_key.txt"),
-    ) as sdk:
-        log.info("Connecting to Cantex API  (%s)", base_url)
-        api_key = await sdk.authenticate()
-        log.info("Authenticated  —  key: %s...", api_key[:8])
+        cfg = load_config()
 
-        strategy = cfg.get("strategy", "swap")
-        log.info("Strategy  :  %s", strategy)
+        raw_key_path = cfg.get("api_key_path", "secrets/api_key.txt")
+        async with CantexSDK(
+            operator,
+            trading,
+            base_url=base_url,
+            api_key_path=raw_key_path,
+        ) as sdk:
+            log.info("Connecting to Cantex API  (%s)", base_url)
+            api_key = await sdk.authenticate()
+            log.info("Authenticated  --  key: %s...", api_key[:8])
 
-        if strategy == "swap":
-            await run_swap_loop(sdk, cfg)
-        elif strategy == "scalp":
-            await run_scalp_loop(sdk, cfg)
+            strategy = cfg.get("strategy", "swap")
+            log.info("Strategy  :  %s", strategy)
+
+            if strategy == "swap":
+                await run_swap_loop(sdk, cfg)
+            elif strategy == "scalp":
+                await run_scalp_loop(sdk, cfg)
 
 
 if __name__ == "__main__":
