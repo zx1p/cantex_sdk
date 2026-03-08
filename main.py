@@ -36,7 +36,8 @@ project root – exactly as before.
 STRATEGIES  (set ``"strategy"`` in each account's config.json)
 ────────────────────────────────────────────────────────────────────────────
   "strategy": "swap"    -- randomised-interval swap loop (original)
-  "strategy": "scalp"   -- price-threshold scalping loop (new)
+  "strategy": "scalp"   -- price-threshold scalping loop
+  "strategy": "drip"    -- one-directional daily drip loop (new)
 
 ────────────────────────────────────────────────────────────────────────────
 SWAP strategy
@@ -66,6 +67,27 @@ SCALP strategy
   - Tracks and logs realised P&L per trade and cumulatively in token_b.
 
 ────────────────────────────────────────────────────────────────────────────
+DRIP strategy
+────────────────────────────────────────────────────────────────────────────
+  - Swaps in one direction per daily session, then sleeps until the next
+    reset (default 00:05 UTC, shortly after the 00:00 UTC daily reset).
+  - Direction is auto-detected from live balances each session:
+      token_a >= min_swap_amount  ->  sell token_a, buy token_b  (A -> B)
+      token_b >= min_swap_amount  ->  sell token_b, buy token_a  (B -> A)
+    This causes the direction to alternate naturally day after day.
+  - The available selling balance is split into at most ``num_swaps`` equal
+    parts.  Each part is guaranteed >= ``min_swap_amount``; if the desired
+    split would produce parts smaller than the minimum, the number of swaps
+    is reduced until the constraint is satisfied.
+  - The final swap of each session drains the full remaining balance so
+    that nothing is left in the sell token at end-of-session.
+  - If the network fee exceeds ``max_network_fee``, the bot waits the
+    normal interval and retries the SAME swap (never skips it) to ensure
+    the entire balance is consumed before the session ends.
+  - After all swaps complete (or balance falls below min_swap_amount) the
+    bot sleeps until the configured daily reset time and starts fresh.
+
+────────────────────────────────────────────────────────────────────────────
 Required .env variables per account:
 
     CANTEX_OPERATOR_KEY   Ed25519 private key hex
@@ -87,6 +109,7 @@ import logging
 import os
 import random
 import sys
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 
 from dotenv import dotenv_values, load_dotenv
@@ -152,7 +175,7 @@ log = logging.getLogger("cantex_bot")
 
 CONFIG_PATH = "config.json"
 ACCOUNTS_DIR = "accounts"
-_VALID_STRATEGIES = ("swap", "scalp")
+_VALID_STRATEGIES = ("swap", "scalp", "drip")
 
 
 def _require_fields(cfg: dict, keys: list[str], section: str, path: str) -> None:
@@ -224,6 +247,33 @@ def _validate_scalp_config(scalp_cfg: dict, path: str) -> None:
         sys.exit(1)
 
 
+def _validate_drip_config(drip_cfg: dict, path: str) -> None:
+    required = [
+        "token_a",
+        "token_b",
+        "min_swap_amount",
+        "interval_min_seconds",
+        "interval_max_seconds",
+        "max_network_fee",
+    ]
+    _require_fields(drip_cfg, required, "drip", path)
+
+    if float(drip_cfg["interval_min_seconds"]) > float(
+        drip_cfg["interval_max_seconds"]
+    ):
+        log.error("drip.interval_min_seconds > drip.interval_max_seconds  (%s)", path)
+        sys.exit(1)
+
+    if Decimal(str(drip_cfg["min_swap_amount"])) <= 0:
+        log.error("drip.min_swap_amount must be a positive value  (%s)", path)
+        sys.exit(1)
+
+    num_swaps = int(drip_cfg.get("num_swaps", 10))
+    if num_swaps < 1:
+        log.error("drip.num_swaps must be >= 1  (%s)", path)
+        sys.exit(1)
+
+
 def load_config(path: str = CONFIG_PATH) -> dict:
     """Load, validate, and return the bot configuration from *path*."""
     if not os.path.exists(path):
@@ -254,6 +304,12 @@ def load_config(path: str = CONFIG_PATH) -> dict:
             sys.exit(1)
         _validate_scalp_config(cfg["scalp"], path)
 
+    elif strategy == "drip":
+        if "drip" not in cfg:
+            log.error("Missing required key 'drip' in config  (%s)", path)
+            sys.exit(1)
+        _validate_drip_config(cfg["drip"], path)
+
     return cfg
 
 
@@ -276,6 +332,15 @@ def random_amount(
     """Return a uniformly random ``Decimal`` in [amount_min, amount_max]."""
     raw = random.uniform(float(amount_min), float(amount_max))
     return _quantize(Decimal(str(raw)), decimal_places)
+
+
+def seconds_until_next_reset(reset_hour: int = 0, reset_minute: int = 5) -> float:
+    """Return seconds until the next reset_hour:reset_minute UTC wall-clock time."""
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
 
 
 async def resolve_instruments(
@@ -995,6 +1060,375 @@ async def run_scalp_loop(
 
 
 # ---------------------------------------------------------------------------
+# Drip strategy helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_drip_state(state_file: str) -> dict:
+    """Load the drip session state from *state_file*. Returns {} on any error."""
+    if not os.path.exists(state_file):
+        return {}
+    try:
+        with open(state_file, "r") as fh:
+            return json.load(fh)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not read drip state file '%s': %s  —  starting fresh",
+            state_file,
+            exc,
+        )
+        return {}
+
+
+def _save_drip_state(
+    state_file: str, data: dict, account_log: logging.Logger = log
+) -> None:
+    """Persist *data* to *state_file* so the session survives restarts."""
+    try:
+        with open(state_file, "w") as fh:
+            json.dump(data, fh)
+    except Exception as exc:  # noqa: BLE001
+        account_log.warning("Could not save drip state to '%s': %s", state_file, exc)
+
+
+# ---------------------------------------------------------------------------
+# Drip strategy loop
+# ---------------------------------------------------------------------------
+
+
+async def run_drip_loop(
+    sdk: CantexSDK,
+    cfg: dict,
+    *,
+    state_file: str = "drip_state.json",
+    account_log: logging.Logger = log,
+) -> None:
+    """
+    Drip strategy — one-directional daily sessions.
+
+    Session flow
+    ------------
+    1. Inspect live balances to determine the swap direction for this session:
+         token_a >= min_swap_amount  ->  sell token_a, buy token_b  (A -> B)
+         token_b >= min_swap_amount  ->  sell token_b, buy token_a  (B -> A)
+         neither                     ->  sleep until next reset and retry.
+
+    2. Divide the available selling balance into at most ``num_swaps`` equal
+       parts, each guaranteed to be >= ``min_swap_amount``.
+       The last swap drains whatever balance remains so nothing is left over.
+
+    3. Execute one part per cycle, waiting a random
+       ``interval_min_seconds`` - ``interval_max_seconds`` between swaps.
+
+       If the network fee exceeds ``max_network_fee``, the bot waits the
+       normal interval and retries the *same* swap (does NOT skip it) so
+       that the full balance is consumed within the session.
+
+    4. When the selling balance drops below ``min_swap_amount`` (or all
+       planned swaps complete), the session ends and the bot sleeps until
+       ``reset_hour_utc:reset_minute_utc`` UTC (default 00:05).
+
+    5. On the next session the opposite token holds the balance, so the
+       direction naturally alternates — A -> B one day, B -> A the next.
+
+    Config keys  (under ``"drip"``)
+    --------------------------------
+    token_a, token_b         : instrument symbols
+    min_swap_amount          : minimum sell amount per swap (hard floor)
+    num_swaps                : target number of swaps per session (default 10)
+    amount_decimal_places    : rounding precision (default 6)
+    interval_min_seconds     : min wait between swaps (seconds)
+    interval_max_seconds     : max wait between swaps (seconds)
+    max_network_fee          : wait + retry if network fee >= this value
+    reset_hour_utc           : UTC hour of daily reset (default 0)
+    reset_minute_utc         : UTC minute of daily reset (default 5)
+    state_file               : path to the session state file (default "drip_state.json")
+
+    Restart safety
+    --------------
+    After every session the UTC date is written to ``state_file``.  On
+    startup (or after a crash) the bot reads that file.  If the stored date
+    equals today's UTC date the session for today is already done and the
+    bot sleeps until the next reset instead of running a duplicate session.
+    A crash that happens *during* a session (before it completes) leaves the
+    state file untouched, so the bot will resume with whatever balance
+    remains — which is the correct behaviour.
+    """
+    drip_cfg = cfg["drip"]
+
+    token_a, token_b = await resolve_instruments(
+        sdk,
+        drip_cfg["token_a"],
+        drip_cfg["token_b"],
+        account_log=account_log,
+    )
+
+    min_swap = Decimal(str(drip_cfg["min_swap_amount"]))
+    num_swaps_cfg = int(drip_cfg.get("num_swaps", 10))
+    decimal_places = int(drip_cfg.get("amount_decimal_places", 6))
+    interval_min = float(drip_cfg["interval_min_seconds"])
+    interval_max = float(drip_cfg["interval_max_seconds"])
+    max_network_fee = Decimal(str(drip_cfg["max_network_fee"]))
+    reset_hour = int(drip_cfg.get("reset_hour_utc", 0))
+    reset_minute = int(drip_cfg.get("reset_minute_utc", 5))
+
+    account_log.info("=" * 60)
+    account_log.info("Cantex Drip Bot  —  Ready")
+    account_log.info(
+        "%-24s  :  %s  (admin: %.16s...)", "Token A", token_a.id, token_a.admin
+    )
+    account_log.info(
+        "%-24s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin
+    )
+    account_log.info("%-24s  :  %s", "Min swap amount", min_swap)
+    account_log.info("%-24s  :  %d", "Target swaps/session", num_swaps_cfg)
+    account_log.info(
+        "%-24s  :  %.1f - %.1f sec", "Interval", interval_min, interval_max
+    )
+    account_log.info("%-24s  :  %s", "Max net fee", max_network_fee)
+    account_log.info("%-24s  :  %02d:%02d UTC", "Daily reset", reset_hour, reset_minute)
+    account_log.info("=" * 60)
+
+    session = 0
+    total_swaps_all = 0
+
+    while True:
+        session += 1
+        account_log.info("━" * 60)
+        account_log.info("Session %d  —  checking balances...", session)
+
+        # ── Guard: skip if today's session already completed ───────────
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        state = _load_drip_state(state_file)
+        if state.get("session_utc_date") == today_utc:
+            secs = seconds_until_next_reset(reset_hour, reset_minute)
+            account_log.info(
+                "Session already completed today (%s)  —  "
+                "sleeping %.0fs (%.1fh) until next reset at %02d:%02d UTC.",
+                today_utc,
+                secs,
+                secs / 3600,
+                reset_hour,
+                reset_minute,
+            )
+            await asyncio.sleep(secs)
+            continue
+
+        # ── Fetch live balances ────────────────────────────────────────
+        try:
+            info = await sdk.get_account_info()
+        except (CantexAPIError, CantexTimeoutError) as exc:
+            account_log.warning("Failed to fetch balances: %s  —  retrying in 60s", exc)
+            await asyncio.sleep(60)
+            session -= 1
+            continue
+
+        bal_a = info.get_balance(token_a)
+        bal_b = info.get_balance(token_b)
+        account_log.info("%-16s  :  %s", token_a.id, bal_a)
+        account_log.info("%-16s  :  %s", token_b.id, bal_b)
+
+        # ── Determine direction ────────────────────────────────────────
+        # Prefer A -> B when token_a has enough; fall back to B -> A.
+        if bal_a >= min_swap:
+            sell_inst, buy_inst = token_a, token_b
+            available = bal_a
+        elif bal_b >= min_swap:
+            sell_inst, buy_inst = token_b, token_a
+            available = bal_b
+        else:
+            secs = seconds_until_next_reset(reset_hour, reset_minute)
+            account_log.info(
+                "Both balances below minimum (%s).  "
+                "Sleeping %.0fs (%.1fh) until %02d:%02d UTC.",
+                min_swap,
+                secs,
+                secs / 3600,
+                reset_hour,
+                reset_minute,
+            )
+            await asyncio.sleep(secs)
+            continue
+
+        direction_label = f"{sell_inst.id}  ->  {buy_inst.id}"
+
+        # ── Divide balance into equal parts ────────────────────────────
+        # num_possible: how many min-sized chunks fit in the available balance
+        num_possible = int(available / min_swap)  # floor
+        num_actual = min(num_swaps_cfg, num_possible)  # always >= 1
+        part_amount = _quantize(available / Decimal(str(num_actual)), decimal_places)
+        # Quantising could dip just below min_swap due to rounding; clamp if so
+        if part_amount < min_swap:
+            part_amount = min_swap
+
+        account_log.info(
+            "Direction : %s  |  Available: %s  |  Parts: %d  |  Each: ~%s",
+            direction_label,
+            available,
+            num_actual,
+            part_amount,
+        )
+
+        # ── Execute swaps for this session ─────────────────────────────
+        session_swaps = 0
+        fee_skips = 0
+        swap_num = 0  # counts *completed* swaps this session
+
+        while swap_num < num_actual:
+            is_last = swap_num == num_actual - 1
+
+            account_log.info(
+                "─── Session %d  |  Swap %d / %d  |  All-time: %d",
+                session,
+                swap_num + 1,
+                num_actual,
+                total_swaps_all,
+            )
+
+            # ── Re-check live balance before every swap ────────────────
+            try:
+                info = await sdk.get_account_info()
+                current_bal = info.get_balance(sell_inst)
+            except (CantexAPIError, CantexTimeoutError) as exc:
+                account_log.warning("Balance check failed: %s  —  retrying in 30s", exc)
+                await asyncio.sleep(30)
+                continue  # retry same swap_num
+
+            account_log.info("%-16s balance  :  %s", sell_inst.id, current_bal)
+
+            if current_bal < min_swap:
+                account_log.info(
+                    "%s balance (%s) fell below minimum (%s)  —  session complete",
+                    sell_inst.id,
+                    current_bal,
+                    min_swap,
+                )
+                break
+
+            # Last swap: drain full remaining balance to leave nothing behind
+            if is_last:
+                swap_amount = _quantize(current_bal, decimal_places)
+            else:
+                swap_amount = min(part_amount, _quantize(current_bal, decimal_places))
+
+            if swap_amount < min_swap:
+                account_log.info(
+                    "Effective amount %s < min %s  —  session complete",
+                    swap_amount,
+                    min_swap,
+                )
+                break
+
+            # ── Get quote ──────────────────────────────────────────────
+            try:
+                quote = await sdk.get_swap_quote(
+                    sell_amount=swap_amount,
+                    sell_instrument=sell_inst,
+                    buy_instrument=buy_inst,
+                )
+            except (CantexAPIError, CantexTimeoutError) as exc:
+                account_log.warning("Quote failed: %s  —  retrying after interval", exc)
+                await asyncio.sleep(random.uniform(interval_min, interval_max))
+                continue  # retry same swap_num
+
+            network_fee = quote.fees.network_fee.amount
+            account_log.info(
+                "Quote  |  sell: %s %s  ->  ~%s %s  |  fee: %s  |  slippage: %s",
+                swap_amount,
+                sell_inst.id,
+                quote.returned_amount,
+                buy_inst.id,
+                network_fee,
+                quote.slippage,
+            )
+
+            if network_fee >= max_network_fee:
+                fee_skips += 1
+                account_log.warning(
+                    "Fee %s >= max %s  —  waiting and retrying  "
+                    "(session fee skips: %d)",
+                    network_fee,
+                    max_network_fee,
+                    fee_skips,
+                )
+                await asyncio.sleep(random.uniform(interval_min, interval_max))
+                continue  # retry same swap_num; do NOT advance the counter
+
+            # ── Execute swap ───────────────────────────────────────────
+            account_log.info(
+                "Executing swap %d / %d  —  %s %s  ->  %s",
+                swap_num + 1,
+                num_actual,
+                swap_amount,
+                sell_inst.id,
+                buy_inst.id,
+            )
+            try:
+                result = await sdk.swap(
+                    sell_amount=swap_amount,
+                    sell_instrument=sell_inst,
+                    buy_instrument=buy_inst,
+                )
+                swap_num += 1
+                session_swaps += 1
+                total_swaps_all += 1
+                account_log.info(
+                    "Swap %d / %d complete  (all-time: %d)  ->  %s",
+                    swap_num,
+                    num_actual,
+                    total_swaps_all,
+                    result,
+                )
+            except CantexAuthError as exc:
+                account_log.error(
+                    "Auth error on swap  (HTTP %d):  %s", exc.status, exc.body[:200]
+                )
+                await asyncio.sleep(random.uniform(interval_min, interval_max))
+                continue  # retry same swap_num
+            except (CantexAPIError, CantexTimeoutError) as exc:
+                account_log.error("Swap failed: %s  —  retrying after interval", exc)
+                await asyncio.sleep(random.uniform(interval_min, interval_max))
+                continue  # retry same swap_num
+
+            # ── Wait before next swap (skip wait after the very last one) ──
+            if swap_num < num_actual:
+                wait = random.uniform(interval_min, interval_max)
+                account_log.info(
+                    "Next swap in %.1fs  (%d remaining)",
+                    wait,
+                    num_actual - swap_num,
+                )
+                await asyncio.sleep(wait)
+
+        # ── Session complete — persist state then sleep until next reset ──
+        _save_drip_state(
+            state_file,
+            {"session_utc_date": today_utc},
+            account_log,
+        )
+        secs = seconds_until_next_reset(reset_hour, reset_minute)
+        account_log.info("━" * 60)
+        account_log.info(
+            "Session %d done  —  %d swap(s) executed  |  All-time total: %d",
+            session,
+            session_swaps,
+            total_swaps_all,
+        )
+        account_log.info(
+            "State saved  —  bot will skip today (%s) if restarted.",
+            today_utc,
+        )
+        account_log.info(
+            "Sleeping %.0fs (%.1fh) until next reset at %02d:%02d UTC.",
+            secs,
+            secs / 3600,
+            reset_hour,
+            reset_minute,
+        )
+        await asyncio.sleep(secs)
+
+
+# ---------------------------------------------------------------------------
 # Multi-account support
 # ---------------------------------------------------------------------------
 
@@ -1097,6 +1531,16 @@ async def run_account(account_name: str, account_dir: str) -> None:
                 await run_swap_loop(sdk, cfg, account_log=account_log)
             elif strategy == "scalp":
                 await run_scalp_loop(sdk, cfg, account_log=account_log)
+            elif strategy == "drip":
+                raw_state = cfg.get("drip", {}).get("state_file", "drip_state.json")
+                state_path = (
+                    raw_state
+                    if os.path.isabs(raw_state)
+                    else os.path.join(account_dir, raw_state)
+                )
+                await run_drip_loop(
+                    sdk, cfg, state_file=state_path, account_log=account_log
+                )
         except Exception as exc:  # noqa: BLE001
             account_log.error(
                 "Unhandled error in strategy loop  :  %s", exc, exc_info=True
@@ -1165,6 +1609,9 @@ async def main() -> None:
                 await run_swap_loop(sdk, cfg)
             elif strategy == "scalp":
                 await run_scalp_loop(sdk, cfg)
+            elif strategy == "drip":
+                raw_state = cfg.get("drip", {}).get("state_file", "drip_state.json")
+                await run_drip_loop(sdk, cfg, state_file=raw_state)
 
 
 if __name__ == "__main__":

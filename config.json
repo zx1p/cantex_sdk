@@ -1,5 +1,5 @@
 {
-  "strategy": "swap",
+  "strategy": "drip",
 
   "api_key_path": "secrets/api_key.txt",
 
@@ -32,6 +32,24 @@
 
     "watch_interval_min_seconds": 60,
     "watch_interval_max_seconds": 120,
+
+    "max_network_fee": "0.1"
+  },
+
+  "drip": {
+    "token_a": "CC",
+    "token_b": "USDCx",
+
+    "min_swap_amount": "4",
+    "num_swaps": 10,
+
+    "amount_decimal_places": 6,
+
+    "interval_min_seconds": 300,
+    "interval_max_seconds": 600,
+
+    "reset_hour_utc": 0,
+    "reset_minute_utc": 5,
 
     "max_network_fee": "0.1"
   }
