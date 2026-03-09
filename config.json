@@ -40,7 +40,6 @@
     "token_a": "CC",
     "token_b": "USDCx",
 
-    "min_swap_amount": "4",
     "num_swaps": 10,
 
     "amount_decimal_places": 6,

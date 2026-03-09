@@ -133,7 +133,6 @@ Kemudian edit `config.json` untuk mengatur strategi dan parameternya (lihat di b
     "token_a": "CC",
     "token_b": "USDCx",
 
-    "min_swap_amount": "4",
     "num_swaps": 10,
 
     "amount_decimal_places": 6,
@@ -192,8 +191,7 @@ Kemudian edit `config.json` untuk mengatur strategi dan parameternya (lihat di b
 | --- | --- | --- | --- |
 | `token_a` | Ya | — | Simbol atau ID instrumen token utama. |
 | `token_b` | Ya | — | Simbol atau ID instrumen token kedua. |
-| `min_swap_amount` | Ya | — | Batas minimum keras untuk setiap nominal swap individu. |
-| `num_swaps` | Tidak | `10` | Target jumlah swap per sesi harian. |
+| `num_swaps` | Tidak | `10` | Jumlah bagian yang sama untuk membagi saldo per sesi harian. |
 | `amount_decimal_places` | Tidak | `6` | Presisi pembulatan nominal swap. |
 | `interval_min_seconds` | Ya | — | Waktu tunggu minimum antar swap dalam satu sesi (detik). |
 | `interval_max_seconds` | Ya | — | Waktu tunggu maksimum antar swap dalam satu sesi (detik). |
@@ -261,13 +259,13 @@ Mesin dua kondisi (**WATCHING** ↔ **HOLDING**) yang mengelola posisi berulang 
 Loop sesi harian satu arah:
 
 1. **Deteksi arah** — di awal setiap sesi, saldo live menentukan arah swap:
-   - `token_a` ≥ `min_swap_amount` → jual `token_a`, beli `token_b` (A → B)
-   - `token_b` ≥ `min_swap_amount` → jual `token_b`, beli `token_a` (B → A)
-   - Keduanya tidak mencukupi → tidur hingga reset harian berikutnya.
+   - `token_a` > 0 → jual `token_a`, beli `token_b` (A → B)
+   - `token_b` > 0 → jual `token_b`, beli `token_a` (B → A)
+   - Keduanya nol → tidur hingga reset harian berikutnya.
 
    Karena seluruh token jual habis di setiap sesi, arah secara alami bergantian dari hari ke hari.
 
-2. **Pembagian saldo** — saldo jual yang tersedia dibagi menjadi paling banyak `num_swaps` bagian yang sama, masing-masing dijamin ≥ `min_swap_amount`. Jika pembagian yang diinginkan menghasilkan bagian di bawah minimum, jumlah swap dikurangi secara otomatis hingga kendala terpenuhi.
+2. **Pembagian saldo** — saldo jual yang tersedia dibagi tepat menjadi `num_swaps` bagian yang sama.
 
 3. **Eksekusi swap** — satu bagian di-swap per siklus, dengan jeda acak `interval_min_seconds` – `interval_max_seconds` di antara setiap swap. Swap terakhir di setiap sesi menguras seluruh saldo yang tersisa agar tidak ada yang tertinggal di token jual.
 

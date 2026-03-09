@@ -251,7 +251,6 @@ def _validate_drip_config(drip_cfg: dict, path: str) -> None:
     required = [
         "token_a",
         "token_b",
-        "min_swap_amount",
         "interval_min_seconds",
         "interval_max_seconds",
         "max_network_fee",
@@ -262,10 +261,6 @@ def _validate_drip_config(drip_cfg: dict, path: str) -> None:
         drip_cfg["interval_max_seconds"]
     ):
         log.error("drip.interval_min_seconds > drip.interval_max_seconds  (%s)", path)
-        sys.exit(1)
-
-    if Decimal(str(drip_cfg["min_swap_amount"])) <= 0:
-        log.error("drip.min_swap_amount must be a positive value  (%s)", path)
         sys.exit(1)
 
     num_swaps = int(drip_cfg.get("num_swaps", 10))
@@ -1109,17 +1104,13 @@ async def run_drip_loop(
     Session flow
     ------------
     1. Inspect live balances to determine the swap direction for this session:
-         token_a >= min_swap_amount                    ->  sell token_a (A -> B)
-         token_b >= min_swap_amount * (price of token_a in token_b)  ->  sell token_b (B -> A)
-         neither                                       ->  sleep until next reset and retry.
+         token_a > 0  ->  sell token_a, buy token_b  (A -> B)
+         token_b > 0  ->  sell token_b, buy token_a  (B -> A)
+         both zero    ->  sleep until next reset and retry.
 
-       min_swap_amount is always expressed in token_a (CC) units.  When the
-       direction is B -> A the bot fetches a 1-unit price probe to convert
-       the minimum into token_b units before any comparison.
-
-    2. Divide the available selling balance into at most ``num_swaps`` equal
-       parts, each guaranteed to be >= ``min_swap_amount``.
-       The last swap drains whatever balance remains so nothing is left over.
+    2. Divide the available selling balance into exactly ``num_swaps`` equal
+       parts.  The last swap drains whatever balance remains so nothing is
+       left over.
 
     3. Execute one part per cycle, waiting a random
        ``interval_min_seconds`` - ``interval_max_seconds`` between swaps.
@@ -1128,8 +1119,8 @@ async def run_drip_loop(
        normal interval and retries the *same* swap (does NOT skip it) so
        that the full balance is consumed within the session.
 
-    4. When the selling balance drops below ``min_swap_amount`` (or all
-       planned swaps complete), the session ends and the bot sleeps until
+    4. When all planned swaps complete (or the remaining balance rounds to
+       zero) the session ends and the bot sleeps until
        ``reset_hour_utc:reset_minute_utc`` UTC (default 00:05).
 
     5. On the next session the opposite token holds the balance, so the
@@ -1138,10 +1129,8 @@ async def run_drip_loop(
     Config keys  (under ``"drip"``)
     --------------------------------
     token_a, token_b         : instrument symbols
-    min_swap_amount          : minimum sell amount per swap, expressed in
-                               token_a (CC) units.  Converted to token_b
-                               units automatically when selling token_b.
-    num_swaps                : target number of swaps per session (default 10)
+    num_swaps                : number of equal parts to split the balance into
+                               per session (default 10)
     amount_decimal_places    : rounding precision (default 6)
     interval_min_seconds     : min wait between swaps (seconds)
     interval_max_seconds     : max wait between swaps (seconds)
@@ -1169,7 +1158,6 @@ async def run_drip_loop(
         account_log=account_log,
     )
 
-    min_swap = Decimal(str(drip_cfg["min_swap_amount"]))
     num_swaps_cfg = int(drip_cfg.get("num_swaps", 10))
     decimal_places = int(drip_cfg.get("amount_decimal_places", 6))
     interval_min = float(drip_cfg["interval_min_seconds"])
@@ -1186,7 +1174,6 @@ async def run_drip_loop(
     account_log.info(
         "%-24s  :  %s  (admin: %.16s...)", "Token B", token_b.id, token_b.admin
     )
-    account_log.info("%-24s  :  %s %s", "Min swap amount", min_swap, token_a.id)
     account_log.info("%-24s  :  %d", "Target swaps/session", num_swaps_cfg)
     account_log.info(
         "%-24s  :  %.1f - %.1f sec", "Interval", interval_min, interval_max
@@ -1235,72 +1222,30 @@ async def run_drip_loop(
         account_log.info("%-16s  :  %s", token_b.id, bal_b)
 
         # ── Determine direction ────────────────────────────────────────
-        # min_swap is always in token_a (CC) units.
-        # For A -> B: compare directly against bal_a.
-        # For B -> A: fetch a price probe to convert min_swap into token_b
-        #             units first, then compare against bal_b.
-        if bal_a >= min_swap:
-            min_swap_effective = min_swap
+        # Prefer A -> B when token_a has any balance; fall back to B -> A.
+        if bal_a > 0:
             sell_inst, buy_inst = token_a, token_b
             available = bal_a
+        elif bal_b > 0:
+            sell_inst, buy_inst = token_b, token_a
+            available = bal_b
         else:
-            # Need the current price to express the minimum in token_b units.
-            try:
-                probe = await sdk.get_swap_quote(
-                    sell_amount=Decimal("1"),
-                    sell_instrument=token_a,
-                    buy_instrument=token_b,
-                )
-            except (CantexAPIError, CantexTimeoutError) as exc:
-                account_log.warning("Price probe failed: %s  —  retrying in 60s", exc)
-                await asyncio.sleep(60)
-                session -= 1
-                continue
-
-            price = probe.pool_price_before_trade  # token_b per 1 token_a
-            min_swap_effective = _quantize(min_swap * price, decimal_places)
+            secs = seconds_until_next_reset(reset_hour, reset_minute)
             account_log.info(
-                "Price probe  :  1 %s = %s %s  →  min swap = %s %s  (≈ %s %s)",
-                token_a.id,
-                price,
-                token_b.id,
-                min_swap_effective,
-                token_b.id,
-                min_swap,
-                token_a.id,
+                "Both balances are zero.  Sleeping %.0fs (%.1fh) until %02d:%02d UTC.",
+                secs,
+                secs / 3600,
+                reset_hour,
+                reset_minute,
             )
-
-            if bal_b >= min_swap_effective:
-                sell_inst, buy_inst = token_b, token_a
-                available = bal_b
-            else:
-                secs = seconds_until_next_reset(reset_hour, reset_minute)
-                account_log.info(
-                    "Both balances below minimum "
-                    "(%s %s  /  %s %s).  "
-                    "Sleeping %.0fs (%.1fh) until %02d:%02d UTC.",
-                    min_swap,
-                    token_a.id,
-                    min_swap_effective,
-                    token_b.id,
-                    secs,
-                    secs / 3600,
-                    reset_hour,
-                    reset_minute,
-                )
-                await asyncio.sleep(secs)
-                continue
+            await asyncio.sleep(secs)
+            continue
 
         direction_label = f"{sell_inst.id}  ->  {buy_inst.id}"
 
         # ── Divide balance into equal parts ────────────────────────────
-        # num_possible: how many min-sized chunks fit in the available balance
-        num_possible = int(available / min_swap_effective)  # floor
-        num_actual = min(num_swaps_cfg, num_possible)  # always >= 1
+        num_actual = num_swaps_cfg
         part_amount = _quantize(available / Decimal(str(num_actual)), decimal_places)
-        # Quantising could dip just below min_swap_effective due to rounding; clamp if so
-        if part_amount < min_swap_effective:
-            part_amount = min_swap_effective
 
         account_log.info(
             "Direction : %s  |  Available: %s  |  Parts: %d  |  Each: ~%s",
@@ -1337,12 +1282,10 @@ async def run_drip_loop(
 
             account_log.info("%-16s balance  :  %s", sell_inst.id, current_bal)
 
-            if current_bal < min_swap_effective:
+            if current_bal <= 0:
                 account_log.info(
-                    "%s balance (%s) fell below minimum (%s)  —  session complete",
+                    "%s balance is zero  —  session complete",
                     sell_inst.id,
-                    current_bal,
-                    min_swap_effective,
                 )
                 break
 
@@ -1352,11 +1295,9 @@ async def run_drip_loop(
             else:
                 swap_amount = min(part_amount, _quantize(current_bal, decimal_places))
 
-            if swap_amount < min_swap_effective:
+            if swap_amount <= 0:
                 account_log.info(
-                    "Effective amount %s < min %s  —  session complete",
-                    swap_amount,
-                    min_swap_effective,
+                    "Effective amount rounds to zero  —  session complete",
                 )
                 break
 

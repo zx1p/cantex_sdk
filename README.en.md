@@ -133,7 +133,6 @@ Then edit `config.json` to set your strategy and parameters (see below).
     "token_a": "CC",
     "token_b": "USDCx",
 
-    "min_swap_amount": "4",
     "num_swaps": 10,
 
     "amount_decimal_places": 6,
@@ -192,8 +191,7 @@ Then edit `config.json` to set your strategy and parameters (see below).
 | --- | --- | --- | --- |
 | `token_a` | Yes | — | Symbol or instrument ID of the primary token. |
 | `token_b` | Yes | — | Symbol or instrument ID of the secondary token. |
-| `min_swap_amount` | Yes | — | Hard floor for any individual swap amount. |
-| `num_swaps` | No | `10` | Target number of swaps per daily session. |
+| `num_swaps` | No | `10` | Number of equal parts to split the session balance into. |
 | `amount_decimal_places` | No | `6` | Rounding precision for swap amounts. |
 | `interval_min_seconds` | Yes | — | Minimum wait between swaps within a session (seconds). |
 | `interval_max_seconds` | Yes | — | Maximum wait between swaps within a session (seconds). |
@@ -267,12 +265,12 @@ A one-directional daily session loop:
 
    Because all of the sell token is consumed each session, the direction naturally alternates day after day.
 
-2. **Splitting the balance** — the available sell balance is divided into at most `num_swaps` equal parts, each guaranteed ≥ `min_swap_amount`. If the desired split would produce parts smaller than the minimum, the number of swaps is reduced automatically until the constraint is satisfied.
+2. **Splitting the balance** — the available sell balance is divided into exactly `num_swaps` equal parts.
 
 3. **Executing swaps** — one part is swapped per cycle, with a random wait of `interval_min_seconds` – `interval_max_seconds` between each. The final swap of the session drains the full remaining balance so nothing is left in the sell token at end-of-session.
 
-4. **Fee retries** — if the quoted fee ≥ `max_network_fee`, the bot waits the normal interval and retries the *same* swap (never skips) to ensure the full balance is consumed before the session ends.
+4. **Fee retries** — if the quoted fee ≥ `max_network_fee`, the bot waits the normal interval and retries the *same* swap (never skips) to ensure the full balance is consumed within the session.
 
-5. **Daily reset** — after all swaps complete (or the balance falls below `min_swap_amount`), the bot sleeps until `reset_hour_utc:reset_minute_utc` UTC and starts a new session.
+5. **Daily reset** — after all swaps complete (or the remaining balance rounds to zero), the bot sleeps until `reset_hour_utc:reset_minute_utc` UTC and starts a new session.
 
-6. **Restart safety** — after every completed session the UTC date is written to `drip_state.json`. On restart, if today's session is already done the bot sleeps until the next reset instead of running a duplicate session. A crash during a session leaves the state file untouched, so the bot resumes with whatever balance remains.
+6. **Restart safety** — after every completed session the UTC date is written to `drip_state.json`. On restart, if today's session is already done the bot sleeps until the next reset instead of running a duplicate session. A crash during a session leaves the state file untouched, so the bot resumes with whatever balance remains (split again into `num_swaps` parts from whatever is left).
