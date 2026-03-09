@@ -1103,10 +1103,14 @@ async def run_drip_loop(
 
     Session flow
     ------------
-    1. Inspect live balances to determine the swap direction for this session:
-         token_a > 0  ->  sell token_a, buy token_b  (A -> B)
-         token_b > 0  ->  sell token_b, buy token_a  (B -> A)
-         both zero    ->  sleep until next reset and retry.
+    1. Inspect live balances to determine the swap direction for this session.
+       The direction alternates each session by reading ``last_direction`` from
+       the state file and preferring the opposite token first.  Falls back to
+       the other token if the preferred one has zero balance.
+
+         last_direction == "a_to_b"  ->  try B -> A first, then A -> B
+         last_direction == "b_to_a"  ->  try A -> B first, then B -> A
+         no history                  ->  default to A -> B
 
     2. Divide the available selling balance into exactly ``num_swaps`` equal
        parts.  The last swap drains whatever balance remains so nothing is
@@ -1222,14 +1226,43 @@ async def run_drip_loop(
         account_log.info("%-16s  :  %s", token_b.id, bal_b)
 
         # ── Determine direction ────────────────────────────────────────
-        # Prefer A -> B when token_a has any balance; fall back to B -> A.
-        if bal_a > 0:
-            sell_inst, buy_inst = token_a, token_b
-            available = bal_a
-        elif bal_b > 0:
-            sell_inst, buy_inst = token_b, token_a
-            available = bal_b
+        # Alternate each session by reading last_direction from state.
+        # The preferred token is the opposite of last session; fall back
+        # to the other token if the preferred one has zero balance.
+        last_dir = state.get("last_direction")  # "a_to_b", "b_to_a", or None
+
+        if last_dir == "a_to_b":
+            ordered = [
+                ("b_to_a", token_b, token_a, bal_b),
+                ("a_to_b", token_a, token_b, bal_a),
+            ]
+        elif last_dir == "b_to_a":
+            ordered = [
+                ("a_to_b", token_a, token_b, bal_a),
+                ("b_to_a", token_b, token_a, bal_b),
+            ]
         else:
+            # No history — default to A -> B.
+            ordered = [
+                ("a_to_b", token_a, token_b, bal_a),
+                ("b_to_a", token_b, token_a, bal_b),
+            ]
+
+        direction_found = False
+        session_direction = "a_to_b"
+        sell_inst, buy_inst, available = token_a, token_b, bal_a
+        for dir_key, s_inst, b_inst, bal in ordered:
+            if bal > 0:
+                session_direction, sell_inst, buy_inst, available = (
+                    dir_key,
+                    s_inst,
+                    b_inst,
+                    bal,
+                )
+                direction_found = True
+                break
+
+        if not direction_found:
             secs = seconds_until_next_reset(reset_hour, reset_minute)
             account_log.info(
                 "Both balances are zero.  Sleeping %.0fs (%.1fh) until %02d:%02d UTC.",
@@ -1385,7 +1418,7 @@ async def run_drip_loop(
         # ── Session complete — persist state then sleep until next reset ──
         _save_drip_state(
             state_file,
-            {"session_utc_date": today_utc},
+            {"session_utc_date": today_utc, "last_direction": session_direction},
             account_log,
         )
         secs = seconds_until_next_reset(reset_hour, reset_minute)
